@@ -87,7 +87,7 @@ function createController(params?: {
     queueContentRefresh: ReturnType<typeof vi.fn>;
     scheduleDiff: ReturnType<typeof vi.fn>;
 } {
-    const buffer = params?.buffer ?? { moves: [], timerId: null };
+    const buffer = params?.buffer ?? { moves: [], timerId: null, flushPromise: null };
     const pendingRenameData = params?.pendingRenameData ?? new Map<string, FileData>();
     const cancelScheduledDiff = vi.fn();
     const queueContentRefresh = vi.fn();
@@ -208,6 +208,35 @@ describe('createRenameFlushController', () => {
         resolvePersist();
         await settle();
         expect(queueContentRefresh).toHaveBeenCalledOnce();
+    });
+
+    it('returns an awaitable flush promise and serializes a later burst', async () => {
+        const releases: (() => void)[] = [];
+        let activePersists = 0;
+        let maxActivePersists = 0;
+        const { store } = createFakeStore({
+            setFiles: async () => {
+                activePersists += 1;
+                maxActivePersists = Math.max(maxActivePersists, activePersists);
+                await new Promise<void>(resolve => releases.push(resolve));
+                activePersists -= 1;
+            }
+        });
+        const { controller, buffer } = createController({ store });
+        buffer.moves.push(makeMove('old/a.md', 'new/a.md'));
+
+        const first = controller.flushNow();
+        expect(first).toBeInstanceOf(Promise);
+        buffer.moves.push(makeMove('old/b.md', 'new/b.md'));
+        const second = controller.flushNow();
+
+        expect(releases).toHaveLength(1);
+        releases.shift()?.();
+        await settle();
+        expect(releases).toHaveLength(1);
+        releases.shift()?.();
+        await Promise.all([first, second]);
+        expect(maxActivePersists).toBe(1);
     });
 
     it('marks renamed feature images unprocessed when the blob move batch fails', async () => {
@@ -342,7 +371,7 @@ describe('createRenameFlushController', () => {
         expect(buffer.timerId).toBe(42);
 
         // `flushNow` runs the flush synchronously; the store batches start before it returns.
-        controller.flushNow();
+        void controller.flushNow();
 
         expect(clearTimeoutSpy).toHaveBeenCalledExactlyOnceWith(42);
         expect(buffer.timerId).toBeNull();
@@ -353,13 +382,13 @@ describe('createRenameFlushController', () => {
     it('flushNow with an empty buffer does nothing', () => {
         const { store, calls } = createFakeStore();
         const { controller } = createController({ store });
-        controller.flushNow();
+        void controller.flushNow();
         expect(calls.setFiles).toEqual([]);
     });
 });
 
 describe('excludeReoccupiedRenameTargets', () => {
-    const emptyBuffer = (): PendingRenameFlushBuffer => ({ moves: [], timerId: null });
+    const emptyBuffer = (): PendingRenameFlushBuffer => ({ moves: [], timerId: null, flushPromise: null });
 
     it('keeps every path when no rename evidence exists', () => {
         const paths = ['notes/a.md', 'notes/b.md'];

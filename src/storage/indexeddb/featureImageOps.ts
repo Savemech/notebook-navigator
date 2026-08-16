@@ -16,7 +16,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { FeatureImageBlobStore, remapSelfReferentialFeatureImageKey } from '../FeatureImageBlobStore';
+import {
+    FeatureImageBlobStore,
+    type FeatureImageBlobReadOptions,
+    remapSelfReferentialFeatureImageKey
+} from '../FeatureImageBlobStore';
 
 interface FeatureImageCoordinatorDeps {
     getDb: () => IDBDatabase | null;
@@ -58,7 +62,7 @@ export class FeatureImageCoordinator {
         this.blobs.moveCacheEntry(oldPath, newPath);
     }
 
-    async getBlob(path: string, expectedKey: string): Promise<Blob | null> {
+    async getBlob(path: string, expectedKey: string, options?: FeatureImageBlobReadOptions): Promise<Blob | null> {
         if (!expectedKey) {
             return null;
         }
@@ -71,12 +75,12 @@ export class FeatureImageCoordinator {
         // Opportunistic cleanup so fallback reads don't persist across unrelated operations.
         this.pruneMovesInFlight();
 
-        const blob = await this.blobs.getBlob(db, path, expectedKey);
+        const blob = await this.blobs.getBlob(db, path, expectedKey, options);
         if (blob || !this.isMoveInFlight(path)) {
             return blob;
         }
 
-        const fallbackBlob = await this.getMoveFallbackBlob(db, path, expectedKey);
+        const fallbackBlob = await this.getMoveFallbackBlob(db, path, expectedKey, options);
         if (fallbackBlob) {
             // Seed the cache under the new path so subsequent reads are fast.
             this.blobs.seedCacheEntry(path, expectedKey, fallbackBlob);
@@ -86,7 +90,12 @@ export class FeatureImageCoordinator {
         return blob;
     }
 
-    private async getMoveFallbackBlob(db: IDBDatabase, path: string, expectedKey: string): Promise<Blob | null> {
+    private async getMoveFallbackBlob(
+        db: IDBDatabase,
+        path: string,
+        expectedKey: string,
+        options?: FeatureImageBlobReadOptions
+    ): Promise<Blob | null> {
         const visited = new Set<string>([path]);
         let currentPath = path;
         let currentExpectedKey = expectedKey;
@@ -99,7 +108,7 @@ export class FeatureImageCoordinator {
             }
 
             const fallbackKey = remapSelfReferentialFeatureImageKey(currentExpectedKey, currentPath, oldPath) ?? currentExpectedKey;
-            const fallbackBlob = await this.blobs.getBlob(db, oldPath, fallbackKey);
+            const fallbackBlob = await this.blobs.getBlob(db, oldPath, fallbackKey, options);
             if (fallbackBlob) {
                 return fallbackBlob;
             }

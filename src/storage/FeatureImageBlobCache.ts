@@ -36,10 +36,13 @@ export class FeatureImageBlobCache {
     private entries = new Map<string, FeatureImageBlobEntry>();
     // Maximum number of cached entries retained in memory.
     private maxEntries: number;
+    private readonly maxBytes: number;
+    private totalBytes = 0;
 
-    constructor(maxEntries: number) {
-        // Clamp to a non-negative size to keep the cache bounded.
+    constructor(maxEntries: number, maxBytes: number = Number.POSITIVE_INFINITY) {
+        // Clamp to non-negative limits to keep the cache bounded.
         this.maxEntries = Math.max(0, maxEntries);
+        this.maxBytes = Number.isFinite(maxBytes) ? Math.max(0, maxBytes) : Number.POSITIVE_INFINITY;
     }
 
     get(path: string, expectedKey: string): Blob | null {
@@ -53,7 +56,7 @@ export class FeatureImageBlobCache {
         if (entry.featureImageKey !== expectedKey) {
             // The key mismatch indicates the stored blob belongs to an older feature image reference.
             // Drop the stale entry so future reads fall back to IndexedDB.
-            this.entries.delete(path);
+            this.removeEntry(path);
             return null;
         }
         // Refresh LRU order by re-inserting the entry as the most-recently-used.
@@ -64,20 +67,24 @@ export class FeatureImageBlobCache {
 
     set(path: string, entry: FeatureImageBlobEntry): void {
         // Skip inserts when the cache is disabled.
-        if (this.maxEntries === 0) {
+        if (this.maxEntries === 0 || this.maxBytes === 0) {
+            return;
+        }
+        // Reject entries that can never fit without flushing unrelated warm cache entries first.
+        if (entry.blob.size > this.maxBytes) {
+            this.removeEntry(path);
             return;
         }
         // Replace existing entries so the newest insert becomes most-recently-used.
-        if (this.entries.has(path)) {
-            this.entries.delete(path);
-        }
+        this.removeEntry(path);
         this.entries.set(path, entry);
+        this.totalBytes += entry.blob.size;
         this.evictIfNeeded();
     }
 
     delete(path: string): void {
         // Remove any cached entry for the path.
-        this.entries.delete(path);
+        this.removeEntry(path);
     }
 
     peek(path: string): FeatureImageBlobEntry | null {
@@ -92,14 +99,17 @@ export class FeatureImageBlobCache {
             return;
         }
         // Preserve the entry while updating its cache key (path).
-        this.entries.delete(oldPath);
+        this.removeEntry(oldPath);
+        this.removeEntry(newPath);
         this.entries.set(newPath, featureImageKey === undefined ? entry : { ...entry, featureImageKey });
+        this.totalBytes += entry.blob.size;
         this.evictIfNeeded();
     }
 
     clear(): void {
         // Remove all cached entries.
         this.entries.clear();
+        this.totalBytes = 0;
     }
 
     getEntryCount(): number {
@@ -107,16 +117,29 @@ export class FeatureImageBlobCache {
         return this.entries.size;
     }
 
+    getTotalBytes(): number {
+        return this.totalBytes;
+    }
+
     private evictIfNeeded(): void {
-        // Evict least-recently-used entries until the cache fits within the configured max size.
-        while (this.entries.size > this.maxEntries) {
+        // Evict least-recently-used entries until both cache bounds are satisfied.
+        while (this.entries.size > this.maxEntries || this.totalBytes > this.maxBytes) {
             // The first key in insertion order is the least-recently-used.
             const iterator = this.entries.keys();
             const first = iterator.next();
             if (first.done) {
                 return;
             }
-            this.entries.delete(first.value);
+            this.removeEntry(first.value);
         }
+    }
+
+    private removeEntry(path: string): void {
+        const entry = this.entries.get(path);
+        if (!entry) {
+            return;
+        }
+        this.entries.delete(path);
+        this.totalBytes = Math.max(0, this.totalBytes - entry.blob.size);
     }
 }

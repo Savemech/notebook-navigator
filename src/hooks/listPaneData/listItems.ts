@@ -820,11 +820,36 @@ export function buildFilePathToIndexMap(listItems: ListPaneItem[]): Map<string, 
 }
 
 export function buildFileIndexMap(files: TFile[]): Map<string, number> {
-    const fileIndexMap = new Map<string, number>();
+    return updateFileIndexSnapshot(undefined, files).map;
+}
+
+export interface FileIndexSnapshot {
+    readonly paths: readonly string[];
+    readonly map: Map<string, number>;
+}
+
+/** Reuses the immutable path-index snapshot when a rebuild produced the same topology. */
+export function updateFileIndexSnapshot(previous: FileIndexSnapshot | undefined, files: readonly TFile[]): FileIndexSnapshot {
+    if (previous && previous.paths.length === files.length) {
+        let topologyChanged = false;
+        for (let index = 0; index < files.length; index += 1) {
+            if (previous.paths[index] !== files[index].path) {
+                topologyChanged = true;
+                break;
+            }
+        }
+        if (!topologyChanged) {
+            return previous;
+        }
+    }
+
+    const paths = new Array<string>(files.length);
+    const map = new Map<string, number>();
     files.forEach((file, index) => {
-        fileIndexMap.set(file.path, index);
+        paths[index] = file.path;
+        map.set(file.path, index);
     });
-    return fileIndexMap;
+    return { paths, map };
 }
 
 export function buildOrderedFiles(listItems: ListPaneItem[]): {

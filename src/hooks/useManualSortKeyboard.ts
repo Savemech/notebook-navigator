@@ -39,6 +39,7 @@ interface UseManualSortKeyboardParams {
     selectedFiles: ReadonlySet<string>;
     selectedFilePath: string | null;
     isSaving: boolean;
+    scrollToFilePath?: (filePath: string) => boolean;
     onKeyboardSelect: (file: TFile, options?: { debounceOpen?: boolean }) => void;
     onScheduleKeyboardOpen?: () => void;
     onScheduleKeyboardOpenForFile?: (file: TFile) => void;
@@ -65,10 +66,8 @@ const getManualSortPageSize = (scrollElement: HTMLElement | null): number => {
     }
 
     const firstRow = scrollElement.querySelector<HTMLElement>('.nn-manual-sort-row');
-    const rowHeight = firstRow?.getBoundingClientRect().height ?? 0;
-    if (rowHeight <= 0) {
-        return 1;
-    }
+    const measuredRowHeight = firstRow?.getBoundingClientRect().height ?? 0;
+    const rowHeight = measuredRowHeight > 0 ? measuredRowHeight : 72;
 
     return Math.max(1, Math.floor(scrollElement.clientHeight / rowHeight) - 1);
 };
@@ -89,6 +88,7 @@ export function useManualSortKeyboard({
     selectedFiles,
     selectedFilePath,
     isSaving,
+    scrollToFilePath,
     onKeyboardSelect,
     onScheduleKeyboardOpen,
     onScheduleKeyboardOpenForFile,
@@ -107,6 +107,9 @@ export function useManualSortKeyboard({
 
     const scrollFilePathIntoView = useCallback(
         (filePath: string) => {
+            if (scrollToFilePath?.(filePath)) {
+                return;
+            }
             const scrollElement = scrollContainerRef.current;
             if (!scrollElement) {
                 return;
@@ -138,7 +141,7 @@ export function useManualSortKeyboard({
                 behavior: 'auto'
             });
         },
-        [scrollContainerRef]
+        [scrollContainerRef, scrollToFilePath]
     );
 
     const scrollKeyboardTargetIntoView = useCallback(

@@ -18,9 +18,12 @@
 
 import { describe, expect, it } from 'vitest';
 import { App, TFile } from 'obsidian';
+import { ItemType } from '../../../src/types';
 import {
     getModifiedSortBoundaryRefreshKey,
     hasPropertySearchContentChange,
+    shouldRefreshListTopologyForContentChanges,
+    shouldRefreshListTopologyForVaultChange,
     shouldRefreshForCustomGroupHeaderMetadataChange,
     shouldSkipModifiedSortBoundaryRefresh
 } from '../../../src/hooks/listPaneData/useListPaneRefresh';
@@ -173,6 +176,78 @@ describe('hasPropertySearchContentChange', () => {
                 basePathSet
             )
         ).toBe(false);
+    });
+});
+
+describe('shouldRefreshListTopologyForContentChanges', () => {
+    const baseArgs = {
+        basePathSet: new Set(['notes/current.md']),
+        hasManualSortWordCountGroupHeaders: false,
+        hasPropertySearchFilters: false,
+        hasTaskSearchFilters: false,
+        hiddenFilePropertyCriteria: false,
+        hiddenFileTags: [] as string[],
+        includeDescendantNotes: false,
+        selectedFolderPath: 'notes',
+        selectedProperty: null,
+        selectedTag: null,
+        selectionType: ItemType.FOLDER,
+        showFileBackgroundUnfinishedTask: false,
+        showHiddenItems: false
+    };
+
+    it('preserves topology for preview and feature-image row updates', () => {
+        expect(
+            shouldRefreshListTopologyForContentChanges({
+                ...baseArgs,
+                changes: [
+                    { path: 'notes/current.md', changes: { preview: 'updated' }, changeType: 'content' },
+                    { path: 'notes/current.md', changes: { featureImageKey: 'image-key' }, changeType: 'content' }
+                ]
+            })
+        ).toBe(false);
+    });
+
+    it('refreshes topology when an active task filter depends on the changed row', () => {
+        expect(
+            shouldRefreshListTopologyForContentChanges({
+                ...baseArgs,
+                changes: [{ path: 'notes/current.md', changes: { taskUnfinished: 1 }, changeType: 'content' }],
+                hasTaskSearchFilters: true
+            })
+        ).toBe(true);
+    });
+});
+
+describe('shouldRefreshListTopologyForVaultChange', () => {
+    const folderArgs = {
+        basePathSet: new Set(['current/existing.md']),
+        includeDescendantNotes: false,
+        selectedFolderPath: 'current',
+        selectionType: ItemType.FOLDER
+    };
+
+    it('ignores file changes outside the selected folder topology', () => {
+        expect(shouldRefreshListTopologyForVaultChange({ ...folderArgs, path: 'other/new.md' })).toBe(false);
+        expect(
+            shouldRefreshListTopologyForVaultChange({
+                ...folderArgs,
+                oldPath: 'other/old.md',
+                path: 'other/renamed.md'
+            })
+        ).toBe(false);
+    });
+
+    it('refreshes for in-scope create, delete, and rename boundaries', () => {
+        expect(shouldRefreshListTopologyForVaultChange({ ...folderArgs, path: 'current/new.md' })).toBe(true);
+        expect(shouldRefreshListTopologyForVaultChange({ ...folderArgs, path: 'current/existing.md' })).toBe(true);
+        expect(
+            shouldRefreshListTopologyForVaultChange({
+                ...folderArgs,
+                oldPath: 'current/existing.md',
+                path: 'other/moved.md'
+            })
+        ).toBe(true);
     });
 });
 

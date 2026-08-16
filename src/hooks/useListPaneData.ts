@@ -28,7 +28,7 @@
  * - Creating efficient lookup maps for file access
  */
 
-import { useMemo, useState } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { TFile, TFolder } from 'obsidian';
 import { useServices } from '../context/ServicesContext';
 import { useFileCache } from '../context/StorageContext';
@@ -50,14 +50,16 @@ import { applyManualSortMarkdownOrder, getManualSortGroupHeaderPropertyKey } fro
 import { getPropertyFieldsFromPropertyKeys } from '../utils/vaultProfiles';
 import { buildHiddenFileState, filterListPaneFiles, useOmnisearchListResult, useSearchableNames } from './listPaneData/searchPipeline';
 import {
-    buildFileIndexMap,
     buildFilePathToIndexMap,
     buildListGroupItemCountData,
     buildListItems,
     buildOrderedFiles,
-    type ListPaneConfig
+    type FileIndexSnapshot,
+    type ListPaneConfig,
+    updateFileIndexSnapshot
 } from './listPaneData/listItems';
 import { useListPaneRefresh } from './listPaneData/useListPaneRefresh';
+import { incrementCounter, trace } from '../services/diagnostics/PerformanceTelemetry';
 
 const EMPTY_SEARCH_META = new Map<string, SearchResultMeta>();
 const EMPTY_HIDDEN_FILE_STATE = new Map<string, boolean>();
@@ -231,19 +233,25 @@ export function useListPaneData({
     const activePropertyFields = useMemo(() => getPropertyFieldsFromPropertyKeys(activeProfile.propertyKeys), [activeProfile.propertyKeys]);
 
     const baseFiles = useMemo(() => {
-        return getFilesForNavigationSelection(
-            {
-                selectionType,
-                selectedFolder,
-                selectedTag,
-                selectedProperty
-            },
-            settings,
-            visibility,
-            app,
-            tagTreeService,
-            propertyTreeService
-        );
+        incrementCounter('list.topology.baseFiles.rebuild');
+        const finishTrace = trace('list.topology.baseFiles.rebuild');
+        try {
+            return getFilesForNavigationSelection(
+                {
+                    selectionType,
+                    selectedFolder,
+                    selectedTag,
+                    selectedProperty
+                },
+                settings,
+                visibility,
+                app,
+                tagTreeService,
+                propertyTreeService
+            );
+        } finally {
+            finishTrace();
+        }
         // eslint-disable-next-line react-hooks/exhaustive-deps -- updateKey refreshes storage data while getFilesForNavigationSelection is static.
     }, [
         selectionType,
@@ -441,32 +449,38 @@ export function useListPaneData({
     }, [groupItemCountData]);
 
     const listItems = useMemo(() => {
-        return buildListItems({
-            app,
-            dayKey,
-            fileVisibility,
-            files,
-            getDB,
-            getFileTimestamps,
-            hiddenFileState,
-            hiddenTags,
-            listConfig,
-            collapsedListGroups,
-            matchedAliases: filterResult.matchedAliases,
-            matchedProperties: filterResult.matchedProperties,
-            searchMetaMap,
-            selectedFolder,
-            selectedTag,
-            selectedProperty,
-            selectionType,
-            showHiddenItems,
-            sortOption,
-            propertySortKey: sortSpec.propertyKey,
-            isManualSortActive,
-            manualSortGroupHeaderPropertyKey,
-            wordCountTargetProperty: settings.wordCountTargetProperty,
-            groupItemCountData
-        });
+        incrementCounter('list.topology.listItems.rebuild');
+        const finishTrace = trace('list.topology.listItems.rebuild');
+        try {
+            return buildListItems({
+                app,
+                dayKey,
+                fileVisibility,
+                files,
+                getDB,
+                getFileTimestamps,
+                hiddenFileState,
+                hiddenTags,
+                listConfig,
+                collapsedListGroups,
+                matchedAliases: filterResult.matchedAliases,
+                matchedProperties: filterResult.matchedProperties,
+                searchMetaMap,
+                selectedFolder,
+                selectedTag,
+                selectedProperty,
+                selectionType,
+                showHiddenItems,
+                sortOption,
+                propertySortKey: sortSpec.propertyKey,
+                isManualSortActive,
+                manualSortGroupHeaderPropertyKey,
+                wordCountTargetProperty: settings.wordCountTargetProperty,
+                groupItemCountData
+            });
+        } finally {
+            finishTrace();
+        }
     }, [
         app,
         dayKey,
@@ -495,18 +509,44 @@ export function useListPaneData({
     ]);
 
     const filePathToIndex = useMemo(() => {
-        return buildFilePathToIndexMap(listItems);
+        incrementCounter('list.topology.filePathToIndex.rebuild');
+        const finishTrace = trace('list.topology.filePathToIndex.rebuild');
+        try {
+            return buildFilePathToIndexMap(listItems);
+        } finally {
+            finishTrace();
+        }
     }, [listItems]);
 
-    const fileIndexMap = useMemo(() => {
-        return buildFileIndexMap(files);
+    const fileIndexSnapshotRef = useRef<FileIndexSnapshot | undefined>(undefined);
+    const fileIndexSnapshot = useMemo(() => {
+        const previousSnapshot = fileIndexSnapshotRef.current;
+        const finishTrace = trace('list.topology.fileIndexMap.reconcile');
+        let snapshot: FileIndexSnapshot;
+        try {
+            snapshot = updateFileIndexSnapshot(previousSnapshot, files);
+        } finally {
+            finishTrace();
+        }
+        incrementCounter(snapshot === previousSnapshot ? 'list.topology.fileIndexMap.reused' : 'list.topology.fileIndexMap.changed');
+        return snapshot;
     }, [files]);
+    useLayoutEffect(() => {
+        fileIndexSnapshotRef.current = fileIndexSnapshot;
+    }, [fileIndexSnapshot]);
+    const fileIndexMap = fileIndexSnapshot.map;
 
     const { orderedFiles, orderedFileIndexMap } = useMemo<{
         orderedFiles: TFile[];
         orderedFileIndexMap: Map<string, number>;
     }>(() => {
-        return buildOrderedFiles(listItems);
+        incrementCounter('list.topology.orderedFiles.rebuild');
+        const finishTrace = trace('list.topology.orderedFiles.rebuild');
+        try {
+            return buildOrderedFiles(listItems);
+        } finally {
+            finishTrace();
+        }
     }, [listItems]);
     const customGroupHeaderState = useMemo(() => {
         const filePaths = new Set<string>();

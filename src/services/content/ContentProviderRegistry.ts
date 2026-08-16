@@ -17,7 +17,12 @@
  */
 
 import { TFile } from 'obsidian';
-import { IContentProvider, type ContentProviderClearContext, type ContentProviderType } from '../../interfaces/IContentProvider';
+import {
+    IContentProvider,
+    type ContentProviderClearContext,
+    type ContentProviderType,
+    type ContentWorkPriority
+} from '../../interfaces/IContentProvider';
 import type { NotebookNavigatorSettings } from '../../settings/types';
 
 /**
@@ -123,7 +128,7 @@ export class ContentProviderRegistry {
     queueFilesForAllProviders(
         files: TFile[],
         settings: NotebookNavigatorSettings,
-        options?: { include?: ContentProviderType[]; exclude?: ContentProviderType[] }
+        options?: { include?: ContentProviderType[]; exclude?: ContentProviderType[]; priority?: ContentWorkPriority }
     ): void {
         const include = options?.include;
         const exclude = options?.exclude;
@@ -143,7 +148,11 @@ export class ContentProviderRegistry {
 
             // Resume provider before queuing so it accepts new work after a stop
             provider.startProcessing(settings);
-            provider.queueFiles(files);
+            if (options?.priority) {
+                provider.queueFiles(files, { priority: options.priority });
+            } else {
+                provider.queueFiles(files);
+            }
         }
     }
 

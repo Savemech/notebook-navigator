@@ -19,6 +19,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
     getOperatorListMetrics,
+    isPdfSourceSizeAllowed,
+    isPdfViewportWithinPixelLimit,
     preflightPdfCoverThumbnailStageA,
     preflightPdfCoverThumbnailStageB,
     scanPdfBytes
@@ -60,6 +62,22 @@ describe('pdfPreflight scanPdfBytes', () => {
         expect(metrics.parsedDimsHits).toBe(0);
         expect(metrics.sumImagePixels).toBe(0);
         expect(metrics.uncertain).toBe(false);
+    });
+});
+
+describe('pdfPreflight resource limits', () => {
+    it('allows PDF source bytes at the cap and rejects larger files', () => {
+        expect(isPdfSourceSizeAllowed(100, 100)).toBe(true);
+        expect(isPdfSourceSizeAllowed(101, 100)).toBe(false);
+        expect(isPdfSourceSizeAllowed(Number.NaN, 100)).toBe(false);
+        expect(isPdfSourceSizeAllowed(-1, 100)).toBe(false);
+    });
+
+    it('allows first-page viewports at the pixel cap and rejects larger or invalid dimensions', () => {
+        expect(isPdfViewportWithinPixelLimit(10_000, 5_000, 50_000_000)).toBe(true);
+        expect(isPdfViewportWithinPixelLimit(10_001, 5_000, 50_000_000)).toBe(false);
+        expect(isPdfViewportWithinPixelLimit(0, 100, 50_000_000)).toBe(false);
+        expect(isPdfViewportWithinPixelLimit(Number.POSITIVE_INFINITY, 100, 50_000_000)).toBe(false);
     });
 });
 

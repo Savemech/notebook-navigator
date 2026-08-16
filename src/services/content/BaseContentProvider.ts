@@ -16,20 +16,25 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { App, TFile } from 'obsidian';
-import { IContentProvider, type ContentProviderType } from '../../interfaces/IContentProvider';
+import { App, Platform, TFile } from 'obsidian';
+import { IContentProvider, type ContentProviderType, type ContentWorkPriority } from '../../interfaces/IContentProvider';
 import type { NotebookNavigatorSettings } from '../../settings/types';
 import { FileData } from '../../storage/IndexedDBStorage';
 import { getDBInstance, isShutdownInProgress } from '../../storage/fileOperations';
 import { getProviderProcessedMtimeField } from '../../storage/providerMtime';
 import { runAsyncAction } from '../../utils/async';
 import { recordContentProviderBatch } from '../diagnostics/DebugLoggingService';
+import { isBenchmarkModeEnabled, recordGauge, recordHighWater } from '../diagnostics/PerformanceTelemetry';
 import { ContentReadCache } from './ContentReadCache';
+import { waitForBackgroundWorkTurn } from './BackgroundWorkController';
 import { LIMITS } from '../../constants/limits';
+import { CONTENT_WORK_PRIORITY_ORDER, ContentWorkScheduler } from './ContentWorkScheduler';
 
 interface ContentJob {
     file: TFile;
     path: string;
+    priority: ContentWorkPriority;
+    signal?: AbortSignal;
 }
 
 export type ContentProviderUpdate = {
@@ -66,18 +71,20 @@ export abstract class BaseContentProvider implements IContentProvider {
     private static readonly RETRY_MAX_ATTEMPTS = LIMITS.contentProvider.retry.maxAttempts;
     private static readonly WAIT_FOR_IDLE_RETRY_POLL_MS = 25;
 
-    // Work queue of file paths; resolved to `TFile` at processing time.
-    protected queue: string[] = [];
+    // One FIFO per scheduler priority allows O(1) promotion without scanning a vault-sized queue.
+    private priorityQueues = new Map<ContentWorkPriority, string[]>(CONTENT_WORK_PRIORITY_ORDER.map(priority => [priority, []]));
+    private priorityQueueHeads = new Map<ContentWorkPriority, number>(CONTENT_WORK_PRIORITY_ORDER.map(priority => [priority, 0]));
     protected isProcessing = false;
     protected abortController: AbortController | null = null;
     protected currentBatchSettings: NotebookNavigatorSettings | null = null;
     // Track files currently being processed to prevent duplicate processing
     // when multiple events fire for the same file in quick succession
     protected processingFiles: Set<string> = new Set();
-    // Track files already queued to avoid unbounded duplicate enqueues
-    protected queuedFiles: Set<string> = new Set();
+    // Canonical queued state. Promoted background entries remain stale in the background array and are skipped on dequeue.
+    private queuedPriorities = new Map<string, ContentWorkPriority>();
     // Tracks file paths queued while already processing, re-enqueued after the current batch finishes.
-    protected dirtyFilesDuringProcessing: Set<string> = new Set();
+    private dirtyFilesDuringProcessing = new Map<string, ContentWorkPriority>();
+    private workScheduler: ContentWorkScheduler | null = null;
 
     // Track provider stop state to prevent any post-stop scheduling or enqueues
     protected stopped = false;
@@ -85,6 +92,105 @@ export abstract class BaseContentProvider implements IContentProvider {
     // Monotonic session counter used to prevent stale batches from writing or mutating provider state after stop/start.
     private processingSession = 0;
     private activeBatchPromise: Promise<void> | null = null;
+
+    private recordQueueMetrics(): void {
+        if (!isBenchmarkModeEnabled()) {
+            return;
+        }
+        const type = this.getContentType();
+        const depth = this.queuedPriorities.size;
+        recordGauge(`provider:${type}:queued`, depth);
+        recordHighWater(`provider:${type}:maxQueued`, depth);
+    }
+
+    protected getQueuedPathCount(): number {
+        return this.queuedPriorities.size;
+    }
+
+    private getNextQueuedPriority(): ContentWorkPriority | undefined {
+        for (const priority of CONTENT_WORK_PRIORITY_ORDER) {
+            const queue = this.priorityQueues.get(priority);
+            let head = this.priorityQueueHeads.get(priority) ?? 0;
+            if (!queue) {
+                continue;
+            }
+            while (head < queue.length) {
+                const path = queue[head];
+                if (this.queuedPriorities.get(path) === priority) {
+                    this.priorityQueueHeads.set(priority, head);
+                    return priority;
+                }
+                head += 1;
+            }
+            this.priorityQueueHeads.set(priority, head);
+        }
+        return undefined;
+    }
+
+    private takeQueuedBatch(onlyPriority?: ContentWorkPriority): { path: string; priority: ContentWorkPriority }[] {
+        const batch: { path: string; priority: ContentWorkPriority }[] = [];
+        const priorities = onlyPriority ? [onlyPriority] : CONTENT_WORK_PRIORITY_ORDER;
+
+        while (batch.length < this.QUEUE_BATCH_SIZE) {
+            let path: string | undefined;
+            for (const priority of priorities) {
+                const queue = this.priorityQueues.get(priority);
+                let head = this.priorityQueueHeads.get(priority) ?? 0;
+                if (!queue) {
+                    continue;
+                }
+                while (head < queue.length) {
+                    const candidate = queue[head++];
+                    if (this.queuedPriorities.get(candidate) === priority) {
+                        path = candidate;
+                        break;
+                    }
+                }
+                this.priorityQueueHeads.set(priority, head);
+                if (path !== undefined) {
+                    break;
+                }
+            }
+            if (path === undefined) {
+                break;
+            }
+            const priority = this.queuedPriorities.get(path);
+            this.queuedPriorities.delete(path);
+            if (priority) {
+                batch.push({ path, priority });
+            }
+        }
+
+        for (const priority of CONTENT_WORK_PRIORITY_ORDER) {
+            const queue = this.priorityQueues.get(priority);
+            const head = this.priorityQueueHeads.get(priority) ?? 0;
+            if (queue && head > 1024 && head * 2 > queue.length) {
+                this.priorityQueues.set(priority, queue.slice(head));
+                this.priorityQueueHeads.set(priority, 0);
+            }
+        }
+
+        return batch;
+    }
+
+    private recordActiveMetrics(): void {
+        if (!isBenchmarkModeEnabled()) {
+            return;
+        }
+        const type = this.getContentType();
+        const active = this.processingFiles.size;
+        recordGauge(`provider:${type}:active`, active);
+        recordHighWater(`provider:${type}:maxActive`, active);
+    }
+
+    private drainTelemetryGauges(): void {
+        if (!isBenchmarkModeEnabled()) {
+            return;
+        }
+        const type = this.getContentType();
+        recordGauge(`provider:${type}:queued`, 0);
+        recordGauge(`provider:${type}:active`, 0);
+    }
 
     private retryTimer: ReturnType<typeof window.setTimeout> | null = null;
     private retryTimerWindow: Window | null = null;
@@ -95,11 +201,15 @@ export abstract class BaseContentProvider implements IContentProvider {
         protected readCache: ContentReadCache | null = null
     ) {}
 
+    setWorkScheduler(scheduler: ContentWorkScheduler): void {
+        this.workScheduler = scheduler;
+    }
+
     /**
      * Yields to the task queue to keep long provider runs responsive without frame-rate throttling.
      */
-    protected async yieldToEventLoop(): Promise<void> {
-        await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+    protected async yieldToEventLoop(signal?: AbortSignal): Promise<void> {
+        await waitForBackgroundWorkTurn(signal);
     }
 
     protected readFileContent(file: TFile): Promise<string> {
@@ -271,21 +381,30 @@ export abstract class BaseContentProvider implements IContentProvider {
      */
     protected onProcessingIdle(): void {}
 
-    queueFiles(files: TFile[]): void {
+    queueFiles(files: TFile[], options?: { priority?: ContentWorkPriority }): void {
         if (this.stopped) return;
+        const priority = options?.priority ?? 'background';
         // Filter out files that are currently being processed or already queued
         let queuedWork = false;
         for (const file of files) {
             const p = file.path;
             if (this.processingFiles.has(p)) {
-                this.dirtyFilesDuringProcessing.add(p);
+                const dirtyPriority = this.dirtyFilesDuringProcessing.get(p);
+                if (!dirtyPriority || CONTENT_WORK_PRIORITY_ORDER.indexOf(priority) < CONTENT_WORK_PRIORITY_ORDER.indexOf(dirtyPriority)) {
+                    this.dirtyFilesDuringProcessing.set(p, priority);
+                }
                 continue;
             }
-            if (this.queuedFiles.has(p)) continue;
-            this.queue.push(p);
-            this.queuedFiles.add(p);
+            const queuedPriority = this.queuedPriorities.get(p);
+            if (queuedPriority && CONTENT_WORK_PRIORITY_ORDER.indexOf(queuedPriority) <= CONTENT_WORK_PRIORITY_ORDER.indexOf(priority)) {
+                continue;
+            }
+            this.queuedPriorities.set(p, priority);
+            this.priorityQueues.get(priority)?.push(p);
             queuedWork = true;
         }
+
+        this.recordQueueMetrics();
 
         if (queuedWork && !this.isProcessing && this.currentBatchSettings) {
             // Run queued work immediately.
@@ -299,7 +418,7 @@ export abstract class BaseContentProvider implements IContentProvider {
         this.stopped = false;
         this.currentBatchSettings = settings;
 
-        if (!this.stopped && !this.isProcessing && this.queue.length > 0) {
+        if (!this.stopped && !this.isProcessing && this.queuedPriorities.size > 0) {
             this.runProcessNextBatch();
         }
     }
@@ -313,7 +432,7 @@ export abstract class BaseContentProvider implements IContentProvider {
         return (
             this.isProcessing ||
             this.activeBatchPromise !== null ||
-            this.queue.length > 0 ||
+            this.queuedPriorities.size > 0 ||
             this.retryTimer !== null ||
             this.hasScheduledRetryWork()
         );
@@ -338,7 +457,7 @@ export abstract class BaseContentProvider implements IContentProvider {
     }
 
     protected async processNextBatch(): Promise<void> {
-        if (this.stopped || this.isProcessing || this.queue.length === 0 || !this.currentBatchSettings) {
+        if (this.stopped || this.isProcessing || this.queuedPriorities.size === 0 || !this.currentBatchSettings) {
             return;
         }
 
@@ -354,16 +473,23 @@ export abstract class BaseContentProvider implements IContentProvider {
         let activeJobs: { job: ContentJob; fileData: FileData | null; needsProcessing: boolean; expectedProviderMtime: number }[] = [];
 
         try {
+            const nextPriority = this.getNextQueuedPriority();
+            if (nextPriority !== 'visible') {
+                await this.yieldToEventLoop(abortSignal);
+            }
+            if (this.stopped || abortSignal.aborted || this.processingSession !== session) {
+                return;
+            }
+
             const db = getDBInstance();
-            const batch = this.queue.splice(0, this.QUEUE_BATCH_SIZE);
-            // Remove from queued set now that they're moving to evaluation/processing
-            batch.forEach(path => this.queuedFiles.delete(path));
+            const batch = this.takeQueuedBatch(nextPriority === 'visible' ? 'visible' : undefined);
+            this.recordQueueMetrics();
 
             // Filter jobs based on current settings and database state
             // Uses synchronous database access for immediate results
             const jobsWithData: { job: ContentJob; fileData: FileData | null; needsProcessing: boolean; expectedProviderMtime: number }[] =
                 [];
-            for (const path of batch) {
+            for (const { path, priority } of batch) {
                 // Re-resolve each path to pick up deletes/renames and avoid holding stale `TFile` references.
                 const abstract = this.app.vault.getAbstractFileByPath(path);
                 if (!(abstract instanceof TFile)) {
@@ -381,7 +507,7 @@ export abstract class BaseContentProvider implements IContentProvider {
                     this.clearRetryForPath(canonicalPath);
                 }
                 const expectedProviderMtime = fileData ? fileData[getProviderProcessedMtimeField(type)] : 0;
-                jobsWithData.push({ job: { file, path: canonicalPath }, fileData, needsProcessing, expectedProviderMtime });
+                jobsWithData.push({ job: { file, path: canonicalPath, priority }, fileData, needsProcessing, expectedProviderMtime });
             }
 
             activeJobs = jobsWithData.filter(item => item.needsProcessing);
@@ -394,6 +520,7 @@ export abstract class BaseContentProvider implements IContentProvider {
             activeJobs.forEach(({ job }) => {
                 this.processingFiles.add(job.path);
             });
+            this.recordActiveMetrics();
 
             // Process files in parallel batches
             const updates: ContentProviderUpdate[] = [];
@@ -409,7 +536,18 @@ export abstract class BaseContentProvider implements IContentProvider {
                     parallelBatch.map(async ({ job, fileData, expectedProviderMtime }) => {
                         try {
                             const fileMtimeAtStart = job.file.stat.mtime;
-                            const result = await this.processFile(job, fileData, settings);
+                            const sourceByteBudget =
+                                LIMITS.contentProvider.scheduler.maxSourceBytes[Platform.isMobile ? 'mobile' : 'desktop'];
+                            const sourceBytes = Number.isFinite(job.file.stat.size) ? Math.max(0, job.file.stat.size) : 0;
+                            const result = this.workScheduler
+                                ? await this.workScheduler.schedule({
+                                      key: `${type}:${job.path}:${fileMtimeAtStart}:${expectedProviderMtime}`,
+                                      priority: job.priority,
+                                      weights: { sourceBytes: Math.min(sourceBytes, sourceByteBudget) },
+                                      signal: abortSignal,
+                                      execute: signal => this.processFile({ ...job, signal }, fileData, settings)
+                                  })
+                                : await this.processFile(job, fileData, settings);
                             return { job, result, fileMtimeAtStart, expectedProviderMtime };
                         } catch (error) {
                             console.error(`Error processing ${job.file.path}:`, error);
@@ -424,8 +562,13 @@ export abstract class BaseContentProvider implements IContentProvider {
                 );
 
                 results.forEach(({ job, result, fileMtimeAtStart, expectedProviderMtime }) => {
-                    // `job.path` is derived at batch start; use the live `TFile` path for DB writes and logs.
-                    const currentPath = job.file.path;
+                    // A rename handler owns the new path. Never let a completion captured under the old
+                    // canonical path overwrite data queued by that handler for the renamed file.
+                    if (job.file.path !== job.path) {
+                        this.clearRetryForPath(job.path);
+                        return;
+                    }
+                    const currentPath = job.path;
                     if (this.processingSession === session && !this.stopped && !abortSignal.aborted) {
                         if (!result.processed) {
                             this.scheduleRetry(currentPath, session);
@@ -448,6 +591,37 @@ export abstract class BaseContentProvider implements IContentProvider {
                         updates.push({ ...result.update, path: currentPath });
                     }
                 });
+
+                const nextIndex = i + this.PARALLEL_LIMIT;
+                const nextParallelBatch = activeJobs.slice(nextIndex, nextIndex + this.PARALLEL_LIMIT);
+                const requeueRemainingForVisibleWork = (): boolean => {
+                    if (nextParallelBatch.length === 0 || this.getNextQueuedPriority() !== 'visible') {
+                        return false;
+                    }
+                    const remainingJobs = activeJobs.slice(nextIndex);
+                    for (const priority of CONTENT_WORK_PRIORITY_ORDER) {
+                        const matchingJobs = remainingJobs.filter(item => item.job.priority === priority);
+                        for (const item of matchingJobs) {
+                            this.processingFiles.delete(item.job.path);
+                        }
+                        const files = matchingJobs.map(item => item.job.file);
+                        if (files.length > 0) {
+                            this.queueFiles(files, { priority });
+                        }
+                    }
+                    activeJobs = activeJobs.slice(0, nextIndex);
+                    this.recordActiveMetrics();
+                    return true;
+                };
+                if (requeueRemainingForVisibleWork()) {
+                    break;
+                }
+                if (nextParallelBatch.some(item => item.job.priority !== 'visible')) {
+                    await this.yieldToEventLoop(abortSignal);
+                    if (requeueRemainingForVisibleWork()) {
+                        break;
+                    }
+                }
             }
 
             // Batch update database
@@ -488,29 +662,32 @@ export abstract class BaseContentProvider implements IContentProvider {
             }
 
             if (isActiveSession) {
-                const dirtyFiles: TFile[] = [];
-                for (const path of this.dirtyFilesDuringProcessing) {
+                const visibleDirtyFiles: TFile[] = [];
+                const backgroundDirtyFiles: TFile[] = [];
+                for (const [path, priority] of this.dirtyFilesDuringProcessing) {
                     const abstract = this.app.vault.getAbstractFileByPath(path);
                     if (abstract instanceof TFile) {
-                        dirtyFiles.push(abstract);
+                        (priority === 'visible' ? visibleDirtyFiles : backgroundDirtyFiles).push(abstract);
                     }
                 }
                 this.dirtyFilesDuringProcessing.clear();
-                if (dirtyFiles.length > 0) {
-                    this.queueFiles(dirtyFiles);
-                }
+                this.queueFiles(visibleDirtyFiles, { priority: 'visible' });
+                this.queueFiles(backgroundDirtyFiles, { priority: 'background' });
             } else if (this.processingSession === session) {
                 this.dirtyFilesDuringProcessing.clear();
             }
 
+            this.recordQueueMetrics();
+            this.recordActiveMetrics();
+
             this.isProcessing = false;
 
-            if (isActiveSession && this.queue.length === 0) {
+            if (isActiveSession && this.queuedPriorities.size === 0) {
                 // Signals subclasses once queued and dirty-file work has drained for this session.
                 this.onProcessingIdle();
             }
 
-            if (this.queue.length > 0 && isActiveSession) {
+            if (this.queuedPriorities.size > 0 && isActiveSession) {
                 this.runProcessNextBatch();
             }
         }
@@ -528,9 +705,11 @@ export abstract class BaseContentProvider implements IContentProvider {
 
         this.clearRetryState();
         this.isProcessing = false;
-        this.queue = [];
+        this.priorityQueues = new Map(CONTENT_WORK_PRIORITY_ORDER.map(priority => [priority, []]));
+        this.priorityQueueHeads = new Map(CONTENT_WORK_PRIORITY_ORDER.map(priority => [priority, 0]));
         this.processingFiles.clear();
-        this.queuedFiles.clear();
+        this.queuedPriorities.clear();
         this.dirtyFilesDuringProcessing.clear();
+        this.drainTelemetryGauges();
     }
 }

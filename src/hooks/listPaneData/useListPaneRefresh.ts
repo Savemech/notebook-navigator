@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef } from 'react';
 import { TFile } from 'obsidian';
 import { debounce } from 'obsidian';
 import type { App, TFolder } from 'obsidian';
@@ -135,6 +135,142 @@ export function hasPropertySearchContentChange(changes: readonly FileContentChan
     return changes.some(change => change.changes.properties !== undefined && basePathSet.has(change.path));
 }
 
+interface ListTopologyContentChangeArgs {
+    changes: readonly FileContentChange[];
+    basePathSet: ReadonlySet<string>;
+    hasManualSortWordCountGroupHeaders: boolean;
+    hasPropertySearchFilters: boolean;
+    hasTaskSearchFilters: boolean;
+    hiddenFilePropertyCriteria: boolean;
+    hiddenFileTags: readonly string[];
+    includeDescendantNotes: boolean;
+    selectedFolderPath: string | null;
+    selectedProperty: PropertySelectionNodeId | null;
+    selectedTag: string | null;
+    selectionType: ItemType | null;
+    showFileBackgroundUnfinishedTask: boolean;
+    showHiddenItems: boolean;
+}
+
+/** Returns true only when cached row content can change list membership, ordering, or grouping. */
+export function shouldRefreshListTopologyForContentChanges({
+    changes,
+    basePathSet,
+    hasManualSortWordCountGroupHeaders,
+    hasPropertySearchFilters,
+    hasTaskSearchFilters,
+    hiddenFilePropertyCriteria,
+    hiddenFileTags,
+    includeDescendantNotes,
+    selectedFolderPath,
+    selectedProperty,
+    selectedTag,
+    selectionType,
+    showFileBackgroundUnfinishedTask,
+    showHiddenItems
+}: ListTopologyContentChangeArgs): boolean {
+    const hasTagChanges = changes.some(change => change.changes.tags !== undefined);
+    const hasPropertyChanges = changes.some(change => change.changes.properties !== undefined);
+    if (hasPropertySearchFilters && hasPropertySearchContentChange(changes, basePathSet)) {
+        return true;
+    }
+
+    if (hasTagChanges || hasPropertyChanges) {
+        const isTagView = selectionType === ItemType.TAG && selectedTag !== null;
+        const isPropertyView = selectionType === ItemType.PROPERTY && selectedProperty !== null;
+        const isFolderView = selectionType === ItemType.FOLDER && selectedFolderPath !== null;
+        if (isTagView && hasTagChanges) {
+            return true;
+        }
+        if (isFolderView && hasTagChanges && selectedFolderPath !== null) {
+            const shouldCheckFolderScope = hiddenFileTags.length > 0;
+            if (
+                changes.some(change => {
+                    if (!shouldCheckFolderScope) {
+                        return basePathSet.has(change.path);
+                    }
+                    if (selectedFolderPath === '/') {
+                        return true;
+                    }
+                    if (!includeDescendantNotes) {
+                        const separatorIndex = change.path.lastIndexOf('/');
+                        const parentPath = separatorIndex === -1 ? '/' : change.path.slice(0, separatorIndex);
+                        return parentPath === selectedFolderPath;
+                    }
+                    return change.path.startsWith(`${selectedFolderPath}/`);
+                })
+            ) {
+                return true;
+            }
+        }
+        if (isPropertyView) {
+            if (hasPropertyChanges) {
+                return true;
+            }
+            if (hasTagChanges) {
+                const hasTagChangesInCurrentList = changes.some(change => basePathSet.has(change.path));
+                const shouldRefreshForTagVisibility = hiddenFileTags.length > 0 && !showHiddenItems;
+                if (hasTagChangesInCurrentList || shouldRefreshForTagVisibility) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (hiddenFilePropertyCriteria && changes.some(change => change.metadataHiddenChanged === true && basePathSet.has(change.path))) {
+        return true;
+    }
+    if (
+        (hasTaskSearchFilters || showFileBackgroundUnfinishedTask) &&
+        changes.some(change => change.changes.taskUnfinished !== undefined && basePathSet.has(change.path))
+    ) {
+        return true;
+    }
+    return (
+        hasManualSortWordCountGroupHeaders &&
+        changes.some(
+            change => (change.changes.wordCount !== undefined || change.changes.properties !== undefined) && basePathSet.has(change.path)
+        )
+    );
+}
+
+interface ListTopologyVaultChangeArgs {
+    basePathSet: ReadonlySet<string>;
+    includeDescendantNotes: boolean;
+    oldPath?: string;
+    path: string;
+    selectedFolderPath: string | null;
+    selectionType: ItemType | null;
+}
+
+/** Filters unrelated vault events before they invalidate a folder list's derived topology. */
+export function shouldRefreshListTopologyForVaultChange({
+    basePathSet,
+    includeDescendantNotes,
+    oldPath,
+    path,
+    selectedFolderPath,
+    selectionType
+}: ListTopologyVaultChangeArgs): boolean {
+    if (selectionType !== ItemType.FOLDER || selectedFolderPath === null) {
+        return true;
+    }
+
+    const pathAffectsSelectedFolder = (candidatePath: string): boolean => {
+        if (basePathSet.has(candidatePath) || selectedFolderPath === '/') {
+            return true;
+        }
+        if (includeDescendantNotes) {
+            return candidatePath.startsWith(`${selectedFolderPath}/`);
+        }
+        const separatorIndex = candidatePath.lastIndexOf('/');
+        const parentPath = separatorIndex === -1 ? '/' : candidatePath.slice(0, separatorIndex);
+        return parentPath === selectedFolderPath;
+    };
+
+    return pathAffectsSelectedFolder(path) || (oldPath !== undefined && pathAffectsSelectedFolder(oldPath));
+}
+
 /**
  * Current metadata detects added headers, while the rendered and count-snapshot paths detect removals
  * after the header property no longer identifies the file as an owner.
@@ -221,6 +357,11 @@ export function useListPaneRefresh({
     const pendingRefreshRef = useRef(false);
     const pendingImmediateRefreshRef = useRef(false);
     const modifiedSortBoundaryRefreshKeysRef = useRef<Map<string, string>>(new Map());
+    const filesRef = useRef(files);
+
+    useLayoutEffect(() => {
+        filesRef.current = files;
+    }, [files]);
 
     useEffect(() => {
         onRefreshRef.current = onRefresh;
@@ -352,15 +493,52 @@ export function useListPaneRefresh({
             });
 
         const vaultEvents = [
-            app.vault.on('create', () => {
+            app.vault.on('create', file => {
+                if (
+                    file instanceof TFile &&
+                    !shouldRefreshListTopologyForVaultChange({
+                        basePathSet,
+                        includeDescendantNotes,
+                        path: file.path,
+                        selectedFolderPath: selectedFolder?.path ?? null,
+                        selectionType
+                    })
+                ) {
+                    return;
+                }
                 clearModifiedSortBoundaryRefreshKeys();
                 queueRefresh();
             }),
-            app.vault.on('delete', () => {
+            app.vault.on('delete', file => {
+                if (
+                    file instanceof TFile &&
+                    !shouldRefreshListTopologyForVaultChange({
+                        basePathSet,
+                        includeDescendantNotes,
+                        path: file.path,
+                        selectedFolderPath: selectedFolder?.path ?? null,
+                        selectionType
+                    })
+                ) {
+                    return;
+                }
                 clearModifiedSortBoundaryRefreshKeys();
                 queueRefresh({ immediateWhenIdle: hasActiveDeleteOperation() });
             }),
-            app.vault.on('rename', () => {
+            app.vault.on('rename', (file, oldPath) => {
+                if (
+                    file instanceof TFile &&
+                    !shouldRefreshListTopologyForVaultChange({
+                        basePathSet,
+                        includeDescendantNotes,
+                        oldPath,
+                        path: file.path,
+                        selectedFolderPath: selectedFolder?.path ?? null,
+                        selectionType
+                    })
+                ) {
+                    return;
+                }
                 clearModifiedSortBoundaryRefreshKeys();
                 queueRefresh();
             }),
@@ -372,7 +550,7 @@ export function useListPaneRefresh({
                 const boundaryRefreshKey = getModifiedSortBoundaryRefreshKey({
                     dayKey,
                     file,
-                    files,
+                    files: filesRef.current,
                     groupBy,
                     sortOption
                 });
@@ -492,65 +670,24 @@ export function useListPaneRefresh({
 
         const db = getDB();
         const dbUnsubscribe = db.onContentChange(changes => {
-            let shouldRefresh = false;
-            const isPropertyView = selectionType === ItemType.PROPERTY && selectedProperty;
-
-            const hasTagChanges = changes.some(change => change.changes.tags !== undefined);
-            const hasPropertyChanges = changes.some(change => change.changes.properties !== undefined);
-            if (hasPropertySearchFilters && hasPropertySearchContentChange(changes, basePathSet)) {
-                shouldRefresh = true;
-            }
-            if (!shouldRefresh && (hasTagChanges || hasPropertyChanges)) {
-                const isTagView = selectionType === ItemType.TAG && selectedTag;
-                const isFolderView = selectionType === ItemType.FOLDER && selectedFolder;
-
-                if (isTagView && hasTagChanges) {
-                    shouldRefresh = true;
-                } else if (isFolderView && hasTagChanges && selectedFolder) {
-                    const folderPath = selectedFolder.path;
-                    const isRootSelection = folderPath === '/';
-                    const shouldCheckFolderScope = hiddenFileTags.length > 0;
-                    shouldRefresh = changes.some(change => {
-                        if (!shouldCheckFolderScope) {
-                            return basePathSet.has(change.path);
-                        }
-                        if (isRootSelection) {
-                            return true;
-                        }
-                        if (!includeDescendantNotes) {
-                            const separatorIndex = change.path.lastIndexOf('/');
-                            const parentPath = separatorIndex === -1 ? '/' : change.path.slice(0, separatorIndex);
-                            return parentPath === folderPath;
-                        }
-                        return change.path.startsWith(`${folderPath}/`);
-                    });
-                } else if (isPropertyView) {
-                    if (hasPropertyChanges) {
-                        shouldRefresh = true;
-                    } else if (hasTagChanges) {
-                        const hasTagChangesInCurrentList = changes.some(change => basePathSet.has(change.path));
-                        const shouldRefreshForTagVisibility = hiddenFileTags.length > 0 && !showHiddenItems;
-                        shouldRefresh = hasTagChangesInCurrentList || shouldRefreshForTagVisibility;
-                    }
-                }
-            }
-
-            if (!shouldRefresh && hiddenFilePropertyMatcher.hasCriteria) {
-                shouldRefresh = changes.some(change => change.metadataHiddenChanged === true && basePathSet.has(change.path));
-            }
-
-            if (!shouldRefresh && (hasTaskSearchFilters || settings.showFileBackgroundUnfinishedTask)) {
-                shouldRefresh = changes.some(change => change.changes.taskUnfinished !== undefined && basePathSet.has(change.path));
-            }
-
-            if (!shouldRefresh && hasManualSortWordCountGroupHeaders) {
-                shouldRefresh = changes.some(
-                    change =>
-                        (change.changes.wordCount !== undefined || change.changes.properties !== undefined) && basePathSet.has(change.path)
-                );
-            }
-
-            if (shouldRefresh) {
+            if (
+                shouldRefreshListTopologyForContentChanges({
+                    changes,
+                    basePathSet,
+                    hasManualSortWordCountGroupHeaders,
+                    hasPropertySearchFilters,
+                    hasTaskSearchFilters,
+                    hiddenFilePropertyCriteria: hiddenFilePropertyMatcher.hasCriteria,
+                    hiddenFileTags,
+                    includeDescendantNotes,
+                    selectedFolderPath: selectedFolder?.path ?? null,
+                    selectedProperty,
+                    selectedTag,
+                    selectionType,
+                    showFileBackgroundUnfinishedTask: settings.showFileBackgroundUnfinishedTask,
+                    showHiddenItems
+                })
+            ) {
                 queueRefresh();
             }
         });
@@ -571,7 +708,6 @@ export function useListPaneRefresh({
         commandQueue,
         customGroupHeaderFilePaths,
         dayKey,
-        files,
         getDB,
         groupBy,
         hasDateSearchFilters,

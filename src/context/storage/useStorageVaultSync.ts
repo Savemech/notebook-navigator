@@ -16,13 +16,14 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
+import { useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
 import { App, EventRef, TAbstractFile, TFile, debounce } from 'obsidian';
 import { TIMEOUTS } from '../../types/obsidian-extended';
 import { INTERNAL_NOTEBOOK_NAVIGATOR_API, type NotebookNavigatorAPI } from '../../api/NotebookNavigatorAPI';
 import type { NotebookNavigatorSettings } from '../../settings/types';
-import type { ContentProviderType, FileContentType } from '../../interfaces/IContentProvider';
+import type { ContentProviderType, ContentWorkPriority, FileContentType } from '../../interfaces/IContentProvider';
 import type { ContentProviderRegistry } from '../../services/content/ContentProviderRegistry';
+import { waitForBackgroundWorkTurn } from '../../services/content/BackgroundWorkController';
 import type { PropertyTreeNode, TagTreeNode } from '../../types/storage';
 import { calculateFileDiff } from '../../storage/diffCalculator';
 import { type FileData as DBFileData } from '../../storage/IndexedDBStorage';
@@ -35,7 +36,18 @@ import { isPropertyFeatureEnabled } from '../../utils/propertyTree';
 import { emitDrawingCompanionImageChange, findDrawingFileForCompanionImage } from '../../utils/drawingFeatureImages';
 import { filterFilesRequiringFileThumbnails, shouldQueueFileThumbnailProvider } from '../storageQueueFilters';
 import { getCacheRebuildProgressTypes, getContentWorkTotal, getMetadataDependentTypes } from './storageContentTypes';
-import { finishStartupDiagnostics, isDebugLogPath, recordStartupDiagnostic } from '../../services/diagnostics/DebugLoggingService';
+import {
+    finishStartupDiagnostics,
+    isDebugLogPath,
+    recordDebugReport,
+    recordStartupDiagnostic
+} from '../../services/diagnostics/DebugLoggingService';
+import {
+    processProgressiveStartupBatches,
+    publishProgressiveStartupReady,
+    runDeferredProgressiveStartup,
+    runProgressiveStartupStep
+} from './progressiveStartup';
 import {
     clearFrontmatterMetadataCacheSignature,
     isFrontmatterMetadataCacheCurrent,
@@ -129,12 +141,14 @@ export function useStorageVaultSync(params: {
     queueMetadataContentWhenReady: (
         files: TFile[],
         includeTypes?: ContentProviderType[],
-        settingsOverride?: NotebookNavigatorSettings
+        settingsOverride?: NotebookNavigatorSettings,
+        priority?: ContentWorkPriority
     ) => void;
     queueIndexableFilesForContentGeneration: (files: TFile[], settings: NotebookNavigatorSettings) => { markdownFiles: TFile[] };
     queueIndexableFilesNeedingContentGeneration: (filesToCheck: TFile[], allFiles: TFile[], settings: NotebookNavigatorSettings) => void;
     disposeMetadataWaitDisposers: () => void;
 }): void {
+    const initialBackgroundPromiseRef = useRef<Promise<void> | null>(null);
     const {
         app,
         api,
@@ -172,7 +186,7 @@ export function useStorageVaultSync(params: {
 
     useEffect(() => {
         // `processExistingCache` is called in two modes:
-        // - Initial load: do a full diff, populate the database, and mark storage ready.
+        // - Initial load: publish the list shell, then reconcile the database and derived content in background.
         // - Incremental updates: schedule a diff after vault events settle.
         const processExistingCache = async (allFiles: TFile[], isInitialLoad: boolean = false) => {
             if (stoppedRef.current) return;
@@ -184,91 +198,177 @@ export function useStorageVaultSync(params: {
                 const initialLoadStartMs = performance.now();
                 try {
                     recordStartupDiagnostic('storage.initialLoad.start', { indexableFileCount: allFiles.length });
-                    const diffStartMs = performance.now();
-                    const { toAdd, toUpdate, toRemove, existingData, cachedFileCount } = calculateFileDiff(allFiles);
-                    const diffElapsedMs = Math.round(performance.now() - diffStartMs);
-
-                    if (toRemove.length > 0) {
-                        await removeFilesFromCache(toRemove);
-                    }
-
-                    if (toAdd.length > 0 || toUpdate.length > 0) {
-                        await recordFileChanges([...toAdd, ...toUpdate], existingData, pendingRenameDataRef.current);
-                    }
-                    const frontmatterMetadataCacheInvalidated = await ensureFrontmatterMetadataCacheMatchesSettings(settings);
-
-                    // Both tree rebuilds share one visible-file scan.
-                    let visibleFilesForTrees: TFile[] | null = null;
-                    const getVisibleFilesForTrees = () => (visibleFilesForTrees ??= getVisibleMarkdownFiles());
-                    let tagTreeElapsedMs = 0;
-                    if (settings.showTags) {
-                        const tagTreeStartMs = performance.now();
-                        rebuildTagTree(getVisibleFilesForTrees);
-                        tagTreeElapsedMs = Math.round(performance.now() - tagTreeStartMs);
-                    }
-                    const propertyTreeStartMs = performance.now();
-                    rebuildPropertyTree(getVisibleFilesForTrees);
-                    const propertyTreeElapsedMs = Math.round(performance.now() - propertyTreeStartMs);
-
-                    isStorageReadyRef.current = true;
-                    setIsStorageReady(true);
-
-                    api?.[INTERNAL_NOTEBOOK_NAVIGATOR_API].setStorageReady(true);
-
-                    const metadataDependentTypes = getMetadataDependentTypes(settings);
-                    const contentEnabled = metadataDependentTypes.length > 0;
-                    const queuedStartupDetails: Record<string, unknown> = { metadataDependentTypes, frontmatterMetadataCacheInvalidated };
-
-                    if (contentRegistryRef.current && contentEnabled) {
-                        const markdownFiles: TFile[] = [];
-                        const fileThumbnailFiles: TFile[] = [];
-                        let filesNeedingThumbnailCount = 0;
-
-                        for (const file of allFiles) {
-                            if (file.extension === 'md') {
-                                markdownFiles.push(file);
-                                continue;
+                    const queuedStartupDetails: Record<string, unknown> = {};
+                    const onBackgroundError = (error: unknown) => {
+                        recordStartupDiagnostic('storage.initialBackground.failed', { error });
+                        console.error('Failed during deferred startup work:', error);
+                    };
+                    publishProgressiveStartupReady({
+                        prepareReady: () => {
+                            const liveSettings = latestSettingsRef.current;
+                            let visibleFilesForTrees: TFile[] | null = null;
+                            const getVisibleFilesForTrees = () => (visibleFilesForTrees ??= getVisibleMarkdownFiles());
+                            if (liveSettings.showTags) {
+                                rebuildTagTree(getVisibleFilesForTrees);
                             }
-                            if (shouldQueueFileThumbnailProvider(file)) {
-                                fileThumbnailFiles.push(file);
-                            }
-                        }
-
-                        if (metadataDependentTypes.length > 0 && markdownFiles.length > 0) {
-                            queueMetadataContentWhenReady(markdownFiles, metadataDependentTypes, settings);
-                        }
-
-                        if (settings.showFeatureImage && fileThumbnailFiles.length > 0) {
-                            const filesNeedingThumbnails = filterFilesRequiringFileThumbnails(fileThumbnailFiles, settings);
-                            filesNeedingThumbnailCount = filesNeedingThumbnails.length;
-                            if (filesNeedingThumbnails.length > 0) {
-                                contentRegistryRef.current.queueFilesForAllProviders(filesNeedingThumbnails, settings, {
-                                    include: ['fileThumbnails']
-                                });
-                            }
-                        }
-
-                        queuedStartupDetails.markdownFiles = markdownFiles.length;
-                        queuedStartupDetails.fileThumbnailFiles = fileThumbnailFiles.length;
-                        queuedStartupDetails.filesNeedingThumbnails = filesNeedingThumbnailCount;
-                    }
-
-                    finishStartupDiagnostics({
-                        status: 'storageReady',
-                        indexableFileCount: allFiles.length,
-                        cachedFileCount,
-                        diff: {
-                            toAdd: toAdd.length,
-                            toUpdate: toUpdate.length,
-                            toRemove: toRemove.length
+                            rebuildPropertyTree(getVisibleFilesForTrees);
                         },
-                        queued: queuedStartupDetails,
-                        timingsMs: {
-                            diff: diffElapsedMs,
-                            tagTree: tagTreeElapsedMs,
-                            propertyTree: propertyTreeElapsedMs,
-                            initialLoad: Math.round(performance.now() - initialLoadStartMs)
-                        }
+                        markReady: () => {
+                            isStorageReadyRef.current = true;
+                            setIsStorageReady(true);
+                            api?.[INTERNAL_NOTEBOOK_NAVIGATOR_API].setStorageReady(true);
+                            finishStartupDiagnostics({
+                                status: 'storageReady',
+                                indexableFileCount: allFiles.length,
+                                timingsMs: {
+                                    shellReady: Math.round(performance.now() - initialLoadStartMs)
+                                }
+                            });
+                        },
+                        scheduleBackground: task => {
+                            const scheduledPromise = waitForBackgroundWorkTurn().then(task).catch(onBackgroundError);
+                            initialBackgroundPromiseRef.current = scheduledPromise;
+                            void scheduledPromise.finally(() => {
+                                if (initialBackgroundPromiseRef.current === scheduledPromise) {
+                                    initialBackgroundPromiseRef.current = null;
+                                }
+                            });
+                        },
+                        isStopped: () => stoppedRef.current,
+                        runBackground: () =>
+                            runDeferredProgressiveStartup({
+                                getItems: getIndexableFiles,
+                                process: async currentFiles => {
+                                    const liveSettings = latestSettingsRef.current;
+                                    const metadataDependentTypes = getMetadataDependentTypes(liveSettings);
+                                    const contentEnabled = metadataDependentTypes.length > 0;
+                                    queuedStartupDetails.metadataDependentTypes = metadataDependentTypes;
+                                    const backgroundStartMs = performance.now();
+                                    const diffStartMs = performance.now();
+                                    const { toAdd, toUpdate, toRemove, existingData, cachedFileCount } = calculateFileDiff(currentFiles);
+                                    const diffElapsedMs = Math.round(performance.now() - diffStartMs);
+                                    if (toRemove.length > 0) {
+                                        await removeFilesFromCache(toRemove);
+                                        if (stoppedRef.current) return;
+                                    }
+                                    if (toAdd.length > 0 || toUpdate.length > 0) {
+                                        await recordFileChanges([...toAdd, ...toUpdate], existingData, pendingRenameDataRef.current);
+                                        if (stoppedRef.current) return;
+                                    }
+                                    const frontmatterMetadataCacheInvalidated =
+                                        await ensureFrontmatterMetadataCacheMatchesSettings(liveSettings);
+                                    if (stoppedRef.current) return;
+                                    queuedStartupDetails.frontmatterMetadataCacheInvalidated = frontmatterMetadataCacheInvalidated;
+                                    let visibleFilesForTrees: TFile[] | null = null;
+                                    const getVisibleFilesForTrees = () => (visibleFilesForTrees ??= getVisibleMarkdownFiles());
+                                    let tagTreeElapsedMs = 0;
+                                    const tagTreeCompleted = await runProgressiveStartupStep({
+                                        waitForTurn: waitForBackgroundWorkTurn,
+                                        isStopped: () => stoppedRef.current,
+                                        run: () => {
+                                            if (liveSettings.showTags) {
+                                                const tagTreeStartMs = performance.now();
+                                                rebuildTagTree(getVisibleFilesForTrees);
+                                                tagTreeElapsedMs = Math.round(performance.now() - tagTreeStartMs);
+                                            }
+                                        }
+                                    });
+                                    if (!tagTreeCompleted) {
+                                        return;
+                                    }
+                                    let propertyTreeElapsedMs = 0;
+                                    const propertyTreeCompleted = await runProgressiveStartupStep({
+                                        waitForTurn: waitForBackgroundWorkTurn,
+                                        isStopped: () => stoppedRef.current,
+                                        run: () => {
+                                            const propertyTreeStartMs = performance.now();
+                                            rebuildPropertyTree(getVisibleFilesForTrees);
+                                            propertyTreeElapsedMs = Math.round(performance.now() - propertyTreeStartMs);
+                                        }
+                                    });
+                                    if (!propertyTreeCompleted) {
+                                        return;
+                                    }
+
+                                    if (
+                                        contentRegistryRef.current &&
+                                        (contentEnabled || liveSettings.showFeatureImage) &&
+                                        !stoppedRef.current
+                                    ) {
+                                        let markdownFileCount = 0;
+                                        let fileThumbnailFileCount = 0;
+                                        let filesNeedingThumbnailCount = 0;
+                                        await processProgressiveStartupBatches({
+                                            items: currentFiles,
+                                            batchSize: 256,
+                                            waitForTurn: waitForBackgroundWorkTurn,
+                                            isStopped: () => stoppedRef.current,
+                                            processBatch: batch => {
+                                                const markdownFiles: TFile[] = [];
+                                                const fileThumbnailFiles: TFile[] = [];
+                                                for (const file of batch) {
+                                                    if (file.extension === 'md') {
+                                                        markdownFiles.push(file);
+                                                        continue;
+                                                    }
+                                                    if (shouldQueueFileThumbnailProvider(file)) {
+                                                        fileThumbnailFiles.push(file);
+                                                    }
+                                                }
+                                                markdownFileCount += markdownFiles.length;
+                                                fileThumbnailFileCount += fileThumbnailFiles.length;
+
+                                                if (metadataDependentTypes.length > 0 && markdownFiles.length > 0) {
+                                                    queueMetadataContentWhenReady(
+                                                        markdownFiles,
+                                                        metadataDependentTypes,
+                                                        liveSettings,
+                                                        'startup-metadata'
+                                                    );
+                                                }
+                                                if (liveSettings.showFeatureImage && fileThumbnailFiles.length > 0) {
+                                                    const filesNeedingThumbnails = filterFilesRequiringFileThumbnails(
+                                                        fileThumbnailFiles,
+                                                        liveSettings
+                                                    );
+                                                    filesNeedingThumbnailCount += filesNeedingThumbnails.length;
+                                                    if (filesNeedingThumbnails.length > 0) {
+                                                        contentRegistryRef.current?.queueFilesForAllProviders(
+                                                            filesNeedingThumbnails,
+                                                            liveSettings,
+                                                            {
+                                                                include: ['fileThumbnails'],
+                                                                priority: 'background'
+                                                            }
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        queuedStartupDetails.markdownFiles = markdownFileCount;
+                                        queuedStartupDetails.fileThumbnailFiles = fileThumbnailFileCount;
+                                        queuedStartupDetails.filesNeedingThumbnails = filesNeedingThumbnailCount;
+                                    }
+                                    const backgroundDetails = {
+                                        cachedFileCount,
+                                        diff: {
+                                            toAdd: toAdd.length,
+                                            toUpdate: toUpdate.length,
+                                            toRemove: toRemove.length
+                                        },
+                                        queued: queuedStartupDetails,
+                                        timingsMs: {
+                                            diff: diffElapsedMs,
+                                            tagTree: tagTreeElapsedMs,
+                                            propertyTree: propertyTreeElapsedMs,
+                                            background: Math.round(performance.now() - backgroundStartMs)
+                                        }
+                                    };
+                                    recordStartupDiagnostic('storage.initialBackground.complete', backgroundDetails);
+                                    recordDebugReport('Startup background reconciliation', backgroundDetails);
+                                }
+                            }),
+                        onBackgroundError
                     });
                 } catch (error: unknown) {
                     recordStartupDiagnostic('storage.initialLoad.failed', { error });
@@ -290,6 +390,8 @@ export function useStorageVaultSync(params: {
                 const processDiff = async () => {
                     if (stoppedRef.current) return;
                     try {
+                        await renameFlushBufferRef.current.flushPromise;
+                        if (stoppedRef.current) return;
                         const { toAdd, toUpdate, toRemove, existingData, cachedFileCount } = calculateFileDiff(allFiles);
                         recordStartupDiagnostic('storage.diff.processed', {
                             indexableFileCount: allFiles.length,
@@ -359,6 +461,11 @@ export function useStorageVaultSync(params: {
 
         const buildFileCache = async (isInitialLoad: boolean = false) => {
             if (stoppedRef.current) return;
+            if (!isInitialLoad) {
+                await initialBackgroundPromiseRef.current;
+                await waitForBackgroundWorkTurn();
+                if (stoppedRef.current) return;
+            }
             const allFiles = getIndexableFiles();
             await processExistingCache(allFiles, isInitialLoad);
         };
@@ -757,7 +864,7 @@ export function useStorageVaultSync(params: {
             // unpersisted. A plain view close never remounts this effect, and the next session's diff
             // would treat the seeded paths as unchanged while deleting the old-path artifacts. On plugin
             // shutdown `stopAllProcessing` has already emptied the buffer and the flush drops out.
-            renameFlushController.flushNow();
+            void renameFlushController.flushNow();
 
             // Clears debouncers and pending waits so no background work continues after teardown.
             cancelTreeRebuildDebouncer({ reset: true });

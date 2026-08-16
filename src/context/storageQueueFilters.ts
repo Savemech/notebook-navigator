@@ -22,9 +22,9 @@ import type { ContentProviderType } from '../interfaces/IContentProvider';
 import type { NotebookNavigatorSettings } from '../settings/types';
 import { getDBInstance } from '../storage/fileOperations';
 import { createFrontmatterPropertyExclusionMatcher } from '../utils/fileFilters';
-import { isGeneratedThumbnailFile } from '../utils/fileTypeUtils';
+import { isGeneratedThumbnailFile, isRasterImageFile } from '../utils/fileTypeUtils';
 import { getActiveHiddenFileProperties } from '../utils/vaultProfiles';
-import { getLocalFeatureImageKey } from '../services/content/FeatureImageContentProvider';
+import { getLocalFeatureImageKey } from '../utils/featureImageKey';
 import { createCaseInsensitiveKeyMatcher } from '../utils/recordUtils';
 import {
     getDrawingDirectFeatureImageKey,
@@ -185,9 +185,9 @@ export function filterFilesRequiringMetadataSources(
     });
 }
 
-function getFileThumbnailFeatureImageKey(file: TFile): string | null {
+function getFileThumbnailFeatureImageKey(file: TFile, settings: NotebookNavigatorSettings): string | null {
     if (isGeneratedThumbnailFile(file)) {
-        return getLocalFeatureImageKey(file);
+        return getLocalFeatureImageKey(file, settings.featureImagePixelSize);
     }
 
     const drawingProviderId = getNonMarkdownDrawingFeatureImageProviderId(file);
@@ -199,7 +199,7 @@ function getFileThumbnailFeatureImageKey(file: TFile): string | null {
 }
 
 export function shouldQueueFileThumbnailProvider(file: TFile): boolean {
-    return getFileThumbnailFeatureImageKey(file) !== null;
+    return isRasterImageFile(file) || isGeneratedThumbnailFile(file) || getNonMarkdownDrawingFeatureImageProviderId(file) !== null;
 }
 
 /**
@@ -213,7 +213,8 @@ export function filterFilesRequiringFileThumbnails(files: TFile[], settings: Not
     }
 
     const candidates = files
-        .map(file => ({ file, expectedKey: getFileThumbnailFeatureImageKey(file) }))
+        // Direct raster thumbnails are viewport-demand driven and must not enter this bulk startup queue.
+        .map(file => ({ file, expectedKey: isRasterImageFile(file) ? null : getFileThumbnailFeatureImageKey(file, settings) }))
         .filter((candidate): candidate is { file: TFile; expectedKey: string } => candidate.expectedKey !== null);
     if (candidates.length === 0) {
         return [];

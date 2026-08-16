@@ -21,7 +21,12 @@ import { localStorage } from '../utils/localStorage';
 import { recordStartupDiagnostic } from '../services/diagnostics/DebugLoggingService';
 import type { ContentProviderType, FileContentType } from '../interfaces/IContentProvider';
 import { isMarkdownPath } from '../utils/fileTypeUtils';
-import { DEFAULT_FEATURE_IMAGE_CACHE_MAX, FEATURE_IMAGE_STORE_NAME, FeatureImageBlobStore } from './FeatureImageBlobStore';
+import {
+    DEFAULT_FEATURE_IMAGE_CACHE_MAX,
+    FEATURE_IMAGE_STORE_NAME,
+    FeatureImageBlobStore,
+    type FeatureImageBlobReadOptions
+} from './FeatureImageBlobStore';
 import { MemoryFileCache } from './MemoryFileCache';
 import { FeatureImageCoordinator } from './indexeddb/featureImageOps';
 import { PreviewTextCoordinator, type PreviewTextBatchOp } from './indexeddb/previewTextOps';
@@ -61,6 +66,7 @@ export type { PropertyItem, PropertyValueKind, FeatureImageStatus, FileContentCh
 
 interface IndexedDBStorageOptions {
     featureImageCacheMaxEntries?: number;
+    featureImageCacheMaxBytes?: number;
     previewTextCacheMaxEntries?: number;
     previewLoadMaxBatch?: number;
     cache?: MemoryFileCache;
@@ -107,7 +113,7 @@ export class IndexedDBStorage {
         const previewLoadMaxBatch = Math.max(1, options?.previewLoadMaxBatch ?? DEFAULT_PREVIEW_LOAD_MAX_BATCH);
         // Initialize the LRU size from caller options or fallback default.
         const featureImageMaxEntries = options?.featureImageCacheMaxEntries ?? DEFAULT_FEATURE_IMAGE_CACHE_MAX;
-        this.featureImageBlobs = new FeatureImageBlobStore(featureImageMaxEntries);
+        this.featureImageBlobs = new FeatureImageBlobStore(featureImageMaxEntries, options?.featureImageCacheMaxBytes);
         this.featureImages = new FeatureImageCoordinator({
             getDb: () => this.db,
             init: () => this.init(),
@@ -1394,8 +1400,8 @@ export class IndexedDBStorage {
      * Fetch a feature image blob by path and expected key.
      * Reads from the in-memory LRU first, then IndexedDB.
      */
-    async getFeatureImageBlob(path: string, expectedKey: string): Promise<Blob | null> {
-        return this.featureImages.getBlob(path, expectedKey);
+    async getFeatureImageBlob(path: string, expectedKey: string, options?: FeatureImageBlobReadOptions): Promise<Blob | null> {
+        return this.featureImages.getBlob(path, expectedKey, options);
     }
 
     /**

@@ -23,6 +23,12 @@ import type { NotebookNavigatorSettings } from '../../src/settings/types';
 import { DEFAULT_SETTINGS } from '../../src/settings/defaultSettings';
 import type { FileData } from '../../src/storage/IndexedDBStorage';
 import { BaseContentProvider, type ContentProviderProcessResult } from '../../src/services/content/BaseContentProvider';
+import { ContentWorkScheduler } from '../../src/services/content/ContentWorkScheduler';
+import {
+    getPerformanceSnapshot,
+    resetPerformanceTelemetry,
+    setBenchmarkModeEnabled
+} from '../../src/services/diagnostics/PerformanceTelemetry';
 
 class FakeDB {
     private readonly files = new Map<string, FileData>();
@@ -189,7 +195,7 @@ class TestTagsProvider extends BaseContentProvider {
     }
 
     getQueueSize(): number {
-        return this.queue.length;
+        return this.getQueuedPathCount();
     }
 
     async runBatch(settings: NotebookNavigatorSettings): Promise<void> {
@@ -227,6 +233,108 @@ class TestTagsProvider extends BaseContentProvider {
     }
 
     protected async yieldToEventLoop(): Promise<void> {}
+}
+
+class ResponsivenessTagsProvider extends BaseContentProvider {
+    private readonly events: string[] = [];
+    private processCalls = 0;
+
+    getEvents(): readonly string[] {
+        return this.events;
+    }
+
+    async runBatch(settings: NotebookNavigatorSettings): Promise<void> {
+        this.onSettingsChanged(settings);
+        await this.processNextBatch();
+    }
+
+    getContentType(): ContentProviderType {
+        return 'tags';
+    }
+
+    getRelevantSettings(): (keyof NotebookNavigatorSettings)[] {
+        return [];
+    }
+
+    shouldRegenerate(): boolean {
+        return false;
+    }
+
+    async clearContent(): Promise<void> {}
+
+    protected needsProcessing(): boolean {
+        return true;
+    }
+
+    protected async processFile(): Promise<ContentProviderProcessResult> {
+        this.processCalls += 1;
+        this.events.push(`process:${this.processCalls}`);
+        if (this.processCalls === 1) {
+            window.setTimeout(() => this.events.push('editor-input'), 0);
+        }
+        return { update: null, processed: true };
+    }
+}
+
+class PriorityTagsProvider extends BaseContentProvider {
+    private readonly processedPaths: string[] = [];
+    private yieldCount = 0;
+
+    getProcessedPaths(): string[] {
+        return this.processedPaths;
+    }
+
+    getYieldCount(): number {
+        return this.yieldCount;
+    }
+
+    async runBatch(settings: NotebookNavigatorSettings): Promise<void> {
+        this.onSettingsChanged(settings);
+        await this.processNextBatch();
+    }
+
+    getContentType(): ContentProviderType {
+        return 'tags';
+    }
+
+    getRelevantSettings(): (keyof NotebookNavigatorSettings)[] {
+        return [];
+    }
+
+    shouldRegenerate(): boolean {
+        return false;
+    }
+
+    async clearContent(): Promise<void> {}
+
+    protected needsProcessing(): boolean {
+        return true;
+    }
+
+    protected async processFile(job: { file: TFile }): Promise<ContentProviderProcessResult> {
+        this.processedPaths.push(job.file.path);
+        return { update: null, processed: true };
+    }
+
+    protected async yieldToEventLoop(): Promise<void> {
+        this.yieldCount += 1;
+    }
+}
+
+class VisiblePreemptionTagsProvider extends PriorityTagsProvider {
+    private visibleFile: TFile | null = null;
+
+    setVisibleFile(file: TFile): void {
+        this.visibleFile = file;
+    }
+
+    protected async yieldToEventLoop(): Promise<void> {
+        await super.yieldToEventLoop();
+        if (this.getYieldCount() === 2 && this.visibleFile) {
+            this.queueFiles([this.visibleFile], { priority: 'visible' });
+            this.visibleFile = null;
+        }
+    }
 }
 
 // Simulates a provider that returns one retry before succeeding.
@@ -335,9 +443,7 @@ class RetryAndSkipQueuedPathTagsProvider extends BaseContentProvider {
         return { update: null, processed: true };
     }
 
-    protected async yieldToEventLoop(): Promise<void> {
-        await vi.advanceTimersByTimeAsync(1);
-    }
+    protected async yieldToEventLoop(): Promise<void> {}
 }
 
 describe('BaseContentProvider race handling', () => {
@@ -350,6 +456,33 @@ describe('BaseContentProvider race handling', () => {
 
     afterEach(() => {
         vi.useRealTimers();
+    });
+
+    it('drops a stale completion when the file is renamed during processing', async () => {
+        const app = new App();
+        const file = new TFile();
+        file.path = 'notes/old.md';
+        file.stat.mtime = 100;
+        const filesByPath = new Map<string, TFile>([[file.path, file]]);
+        app.vault.getAbstractFileByPath = (path: string) => filesByPath.get(path) ?? null;
+        db.setFile(file.path, createFileData({ mtime: 100, tagsMtime: 0 }));
+        const started = createDeferredVoid();
+        const release = createDeferredVoid();
+        const provider = new TestTagsProvider(app, { onStarted: started.resolve, release: release.promise });
+
+        provider.queueFiles([file]);
+        const batch = provider.runBatch(settings);
+        await started.promise;
+
+        filesByPath.delete('notes/old.md');
+        file.path = 'notes/new.md';
+        filesByPath.set(file.path, file);
+        db.setFile(file.path, createFileData({ mtime: 100, tagsMtime: 0 }));
+        release.resolve();
+        await batch;
+
+        expect(db.getFile('notes/new.md')?.tagsMtime).toBe(0);
+        expect(db.getAppliedProviderMtimeUpdates('tags', 'notes/new.md')).toEqual([]);
     });
 
     it('requeues paths queued during processing and snapshots mtime at start', async () => {
@@ -563,5 +696,273 @@ describe('BaseContentProvider race handling', () => {
 
         provider.stopProcessing();
         vi.runAllTimers();
+    });
+
+    it('yields to editor input before starting more than one background concurrency chunk', async () => {
+        vi.useRealTimers();
+        const app = new App();
+        const files = Array.from({ length: 5 }, (_, index) => {
+            const file = new TFile();
+            file.path = `notes/responsive-${index}.md`;
+            file.stat.mtime = index + 1;
+            db.setFile(file.path, createFileData({ mtime: file.stat.mtime, tagsMtime: 0 }));
+            return file;
+        });
+        const filesByPath = new Map(files.map(file => [file.path, file]));
+        app.vault.getAbstractFileByPath = (path: string) => filesByPath.get(path) ?? null;
+
+        const provider = new ResponsivenessTagsProvider(app);
+        provider.queueFiles(files);
+        await provider.runBatch(settings);
+        await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+
+        const inputIndex = provider.getEvents().indexOf('editor-input');
+        expect(inputIndex).toBeGreaterThanOrEqual(0);
+        expect(
+            provider
+                .getEvents()
+                .slice(0, inputIndex)
+                .filter(event => event.startsWith('process:'))
+        ).toHaveLength(2);
+    });
+
+    it('promotes visible work ahead of queued background work without duplicates', async () => {
+        const app = new App();
+        const files = ['background-a.md', 'background-b.md', 'visible.md'].map((path, index) => {
+            const file = new TFile();
+            file.path = path;
+            file.stat.mtime = index + 1;
+            db.setFile(path, createFileData({ mtime: file.stat.mtime, tagsMtime: 0 }));
+            return file;
+        });
+        const filesByPath = new Map(files.map(file => [file.path, file]));
+        app.vault.getAbstractFileByPath = (path: string) => filesByPath.get(path) ?? null;
+        const provider = new PriorityTagsProvider(app);
+
+        provider.queueFiles(files.slice(0, 2), { priority: 'background' });
+        provider.queueFiles([files[2]], { priority: 'visible' });
+        provider.queueFiles([files[2]], { priority: 'visible' });
+        await provider.runBatch(settings);
+
+        expect(provider.getProcessedPaths()).toEqual(['visible.md', 'background-a.md', 'background-b.md']);
+        expect(provider.getYieldCount()).toBe(1);
+    });
+
+    it('interrupts the remaining background chunks when visible work arrives', async () => {
+        const app = new App();
+        const background = Array.from({ length: 5 }, (_, index) => {
+            const file = new TFile();
+            file.path = `background-${index}.md`;
+            return file;
+        });
+        const visible = new TFile();
+        visible.path = 'new-visible.md';
+        const files = [...background, visible];
+        files.forEach((file, index) => {
+            file.stat.mtime = index + 1;
+            db.setFile(file.path, createFileData({ mtime: file.stat.mtime, tagsMtime: 0 }));
+        });
+        const filesByPath = new Map(files.map(file => [file.path, file]));
+        app.vault.getAbstractFileByPath = (path: string) => filesByPath.get(path) ?? null;
+        const provider = new VisiblePreemptionTagsProvider(app);
+        provider.setVisibleFile(visible);
+
+        provider.queueFiles(background, { priority: 'background' });
+        await provider.runBatch(settings);
+        await provider.waitForIdle();
+
+        expect(provider.getProcessedPaths()).toEqual([
+            'background-0.md',
+            'background-1.md',
+            'new-visible.md',
+            'background-2.md',
+            'background-3.md',
+            'background-4.md'
+        ]);
+    });
+
+    it('starts visible work without the background quiet gate while retaining it for background work', async () => {
+        const app = new App();
+        const visible = new TFile('visible-only.md');
+        visible.stat.mtime = 1;
+        const background = new TFile('background-only.md');
+        background.stat.mtime = 2;
+        db.setFile(visible.path, createFileData({ mtime: visible.stat.mtime, tagsMtime: 0 }));
+        db.setFile(background.path, createFileData({ mtime: background.stat.mtime, tagsMtime: 0 }));
+        const filesByPath = new Map([
+            [visible.path, visible],
+            [background.path, background]
+        ]);
+        app.vault.getAbstractFileByPath = (path: string) => filesByPath.get(path) ?? null;
+        const provider = new PriorityTagsProvider(app);
+
+        provider.queueFiles([visible], { priority: 'visible' });
+        await provider.runBatch(settings);
+        expect(provider.getYieldCount()).toBe(0);
+
+        provider.queueFiles([background], { priority: 'background' });
+        await provider.runBatch(settings);
+        expect(provider.getYieldCount()).toBe(1);
+    });
+
+    it('dequeues the full scheduler priority order before background work', async () => {
+        const app = new App();
+        const priorities = [
+            ['background.md', 'background'],
+            ['startup.md', 'startup-metadata'],
+            ['selected.md', 'selected-folder']
+        ] as const;
+        const files = priorities.map(([path], index) => {
+            const file = new TFile();
+            file.path = path;
+            file.stat.mtime = index + 1;
+            db.setFile(path, createFileData({ mtime: file.stat.mtime, tagsMtime: 0 }));
+            return file;
+        });
+        const filesByPath = new Map(files.map(file => [file.path, file]));
+        app.vault.getAbstractFileByPath = (path: string) => filesByPath.get(path) ?? null;
+        const provider = new PriorityTagsProvider(app);
+
+        priorities.forEach(([, priority], index) => provider.queueFiles([files[index]], { priority }));
+        await provider.runBatch(settings);
+
+        expect(provider.getProcessedPaths()).toEqual(['selected.md', 'startup.md', 'background.md']);
+    });
+
+    it('enforces one shared active-job budget across provider instances', async () => {
+        const app = new App();
+        const firstFile = new TFile();
+        firstFile.path = 'first.md';
+        firstFile.stat.mtime = 100;
+        firstFile.stat.size = 10;
+        const secondFile = new TFile();
+        secondFile.path = 'second.md';
+        secondFile.stat.mtime = 100;
+        secondFile.stat.size = 10;
+        app.vault.getAbstractFileByPath = (path: string) => [firstFile, secondFile].find(file => file.path === path) ?? null;
+        db.setFile(firstFile.path, createFileData({ mtime: 100, tagsMtime: 0 }));
+        db.setFile(secondFile.path, createFileData({ mtime: 100, tagsMtime: 0 }));
+
+        const started = createDeferredVoid();
+        const release = createDeferredVoid();
+        const first = new TestTagsProvider(app, { onStarted: started.resolve, release: release.promise });
+        const second = new TestTagsProvider(app, null);
+        const scheduler = new ContentWorkScheduler({
+            activeJobs: 1,
+            sourceBytes: 100,
+            decodedPixels: 0,
+            pdfSlots: 0,
+            externalSlots: 0
+        });
+        first.setWorkScheduler(scheduler);
+        second.setWorkScheduler(scheduler);
+        first.queueFiles([firstFile]);
+        second.queueFiles([secondFile]);
+
+        const firstRun = first.runBatch(settings);
+        await started.promise;
+        const secondRun = second.runBatch(settings);
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(first.getCallCount()).toBe(1);
+        expect(second.getCallCount()).toBe(0);
+        expect(scheduler.snapshot()).toMatchObject({ running: 1, queued: 1 });
+
+        release.resolve();
+        await Promise.all([firstRun, secondRun]);
+        expect(second.getCallCount()).toBe(1);
+        expect(scheduler.snapshot()).toMatchObject({ running: 0, queued: 0 });
+    });
+
+    describe('telemetry', () => {
+        beforeEach(() => {
+            setBenchmarkModeEnabled(false);
+            resetPerformanceTelemetry();
+        });
+
+        it('records queue depth and high-water mark', async () => {
+            setBenchmarkModeEnabled(true);
+            const app = new App();
+            const file = new TFile();
+            file.path = 'notes/note.md';
+            file.stat.mtime = 100;
+            app.vault.getAbstractFileByPath = (path: string) => (path === file.path ? file : null);
+
+            db.setFile(
+                file.path,
+                createFileData({
+                    mtime: file.stat.mtime,
+                    tagsMtime: 0
+                })
+            );
+
+            const provider = new TestTagsProvider(app, null);
+            provider.queueFiles([file]);
+
+            const snapshot = getPerformanceSnapshot();
+            expect(snapshot.gauges['provider:tags:queued']).toBe(1);
+            expect(snapshot.highWater['provider:tags:maxQueued']).toBe(1);
+
+            await provider.runBatch(settings);
+            const after = getPerformanceSnapshot();
+            expect(after.gauges['provider:tags:queued']).toBe(0);
+            expect(after.highWater['provider:tags:maxQueued']).toBe(1);
+
+            provider.stopProcessing();
+            vi.runAllTimers();
+        });
+
+        it('drains queue and active gauges on stop', () => {
+            setBenchmarkModeEnabled(true);
+            const app = new App();
+            const file = new TFile();
+            file.path = 'notes/note.md';
+            file.stat.mtime = 100;
+            app.vault.getAbstractFileByPath = (path: string) => (path === file.path ? file : null);
+
+            db.setFile(
+                file.path,
+                createFileData({
+                    mtime: file.stat.mtime,
+                    tagsMtime: 0
+                })
+            );
+
+            const provider = new TestTagsProvider(app, null);
+            provider.queueFiles([file]);
+            provider.stopProcessing();
+
+            const snapshot = getPerformanceSnapshot();
+            expect(snapshot.gauges['provider:tags:queued']).toBe(0);
+            expect(snapshot.gauges['provider:tags:active']).toBe(0);
+        });
+
+        it('does not record telemetry when benchmark mode is disabled', async () => {
+            setBenchmarkModeEnabled(false);
+            const app = new App();
+            const file = new TFile();
+            file.path = 'notes/note.md';
+            file.stat.mtime = 100;
+            app.vault.getAbstractFileByPath = (path: string) => (path === file.path ? file : null);
+
+            db.setFile(
+                file.path,
+                createFileData({
+                    mtime: file.stat.mtime,
+                    tagsMtime: 0
+                })
+            );
+
+            const provider = new TestTagsProvider(app, null);
+            provider.queueFiles([file]);
+            await provider.runBatch(settings);
+
+            const snapshot = getPerformanceSnapshot();
+            expect(snapshot.gauges['provider:tags:queued']).toBeUndefined();
+            expect(snapshot.gauges['provider:tags:active']).toBeUndefined();
+
+            provider.stopProcessing();
+            vi.runAllTimers();
+        });
     });
 });

@@ -19,6 +19,7 @@
 import { App, Platform } from 'obsidian';
 import { STORAGE_KEYS } from '../../types';
 import { localStorage } from '../../utils/localStorage';
+import { getPerformanceSnapshot, isBenchmarkModeEnabled } from './PerformanceTelemetry';
 
 const DEBUG_LOG_FILE_PREFIX = 'nn-debug-';
 const DEBUG_LOG_FILE_SUFFIX = '.md';
@@ -463,6 +464,7 @@ export class DebugLoggingService {
             ...(session.storageReadyDetails ? { storage: session.storageReadyDetails } : {}),
             ...(session.userVisibleDetails ? { userVisible: session.userVisibleDetails } : {}),
             ...(this.contentProviderBatches.size > 0 ? { contentProviderBatches: this.getContentProviderSummaries() } : {}),
+            ...(isBenchmarkModeEnabled() ? { performanceSnapshot: getPerformanceSnapshot() } : {}),
             ...details
         });
         this.contentProviderBatches.clear();

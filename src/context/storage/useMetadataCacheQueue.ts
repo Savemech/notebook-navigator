@@ -19,7 +19,7 @@
 import { useCallback, useEffect, useRef, type MutableRefObject } from 'react';
 import { EventRef, TFile, type App } from 'obsidian';
 import type { ContentProviderRegistry } from '../../services/content/ContentProviderRegistry';
-import type { ContentProviderType } from '../../interfaces/IContentProvider';
+import type { ContentProviderType, ContentWorkPriority } from '../../interfaces/IContentProvider';
 import type { NotebookNavigatorSettings } from '../../settings/types';
 import { filterFilesRequiringMetadataSources } from '../storageQueueFilters';
 import { getMetadataDependentTypes, resolveMetadataDependentTypes } from './storageContentTypes';
@@ -93,7 +93,8 @@ export function useMetadataCacheQueue(params: {
     queueMetadataContentWhenReady: (
         files: TFile[],
         includeTypes?: ContentProviderType[],
-        settingsOverride?: NotebookNavigatorSettings
+        settingsOverride?: NotebookNavigatorSettings,
+        priority?: ContentWorkPriority
     ) => void;
     disposeMetadataWaitDisposers: () => void;
 } {
@@ -493,7 +494,12 @@ export function useMetadataCacheQueue(params: {
     }, [app, clearWarningTimer, maybeQueuePendingFile, metadataWaitDisposersRef, pendingMetadataWaitPathsRef, scheduleWarning, startSweep]);
 
     const queueMetadataContentWhenReady = useCallback(
-        (files: TFile[], includeTypes?: ContentProviderType[], settingsOverride?: NotebookNavigatorSettings) => {
+        (
+            files: TFile[],
+            includeTypes?: ContentProviderType[],
+            settingsOverride?: NotebookNavigatorSettings,
+            priority?: ContentWorkPriority
+        ) => {
             const baseSettings = settingsOverride ?? latestSettingsRef.current;
             const requestedTypes = resolveMetadataDependentTypes(baseSettings, includeTypes);
             const requestedMask = getPendingMetadataWaitMaskForTypes(requestedTypes);
@@ -559,7 +565,7 @@ export function useMetadataCacheQueue(params: {
                 if (activeTypes.length === 0 || !contentRegistryRef.current) {
                     return;
                 }
-                contentRegistryRef.current.queueFilesForAllProviders(targetFiles, latestSettings, { include: activeTypes });
+                contentRegistryRef.current.queueFilesForAllProviders(targetFiles, latestSettings, { include: activeTypes, priority });
             };
 
             // Queue files with metadata cache already ready

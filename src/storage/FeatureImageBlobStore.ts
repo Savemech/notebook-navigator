@@ -19,6 +19,7 @@
 import { FeatureImageBlobCache } from './FeatureImageBlobCache';
 import type { FeatureImageStatus } from './IndexedDBStorage';
 import { LIMITS } from '../constants/limits';
+import { ContentWorkScheduler, type ContentWorkPriority } from '../services/content/ContentWorkScheduler';
 
 // Blob store for feature image thumbnails keyed by file path.
 export const FEATURE_IMAGE_STORE_NAME = 'featureImageBlobs';
@@ -28,6 +29,22 @@ export const DEFAULT_FEATURE_IMAGE_CACHE_MAX = LIMITS.storage.featureImageCacheM
 export interface FeatureImageBlobRecord {
     featureImageKey: string;
     blob: Blob;
+}
+
+export interface FeatureImageBlobReadOptions {
+    signal?: AbortSignal;
+    priority?: Extract<ContentWorkPriority, 'visible' | 'background'>;
+}
+
+export interface FeatureImageBlobStoreOptions {
+    maxConcurrentReads?: number;
+    readTimeoutMs?: number;
+}
+
+function makeAbortError(): Error {
+    const error = new Error('The feature image read was aborted');
+    error.name = 'AbortError';
+    return error;
 }
 
 export function remapSelfReferentialFeatureImageKey(
@@ -135,6 +152,9 @@ export function computeFeatureImageMutation(params: {
  */
 export class FeatureImageBlobStore {
     private readonly cache: FeatureImageBlobCache;
+    private readonly storeOptions: Required<FeatureImageBlobStoreOptions>;
+    private readScheduler: ContentWorkScheduler;
+    private readSchedulerReady: Promise<void> | null = null;
     // Global counter used to invalidate all in-flight reads when memory caches are cleared.
     private globalCacheEpoch = 0;
     // Per-path counter used to invalidate in-flight reads when the cache is cleared.
@@ -143,29 +163,29 @@ export class FeatureImageBlobStore {
     // If the epoch changes before the read completes, the result is returned to the caller
     // but is not inserted into the LRU to avoid repopulating stale data.
     private cacheEpochs = new Map<string, number>();
-    // Tracks in-flight reads by path + expectedKey to deduplicate concurrent requests.
-    //
-    // Structure:
-    // - First key: file path
-    // - Second key: expected feature image key for that path
-    // - Value: promise resolving to the stored blob (or null)
-    private inFlight = new Map<string, Map<string, Promise<Blob | null>>>();
-
-    constructor(maxEntries: number) {
-        this.cache = new FeatureImageBlobCache(maxEntries);
+    constructor(maxEntries: number, maxBytes?: number, options?: FeatureImageBlobStoreOptions) {
+        this.cache = new FeatureImageBlobCache(maxEntries, maxBytes);
+        this.storeOptions = {
+            maxConcurrentReads: Math.max(1, options?.maxConcurrentReads ?? 2),
+            readTimeoutMs: Math.max(1, options?.readTimeoutMs ?? 15_000)
+        };
+        this.readScheduler = this.createReadScheduler();
     }
 
     clearMemoryCaches(): void {
         // Clears:
         // - the in-memory LRU (thumbnails)
         // - cache invalidation epochs
-        // - in-flight request registry
+        // - queued/running reads
         //
         // Called when the database connection changes (open/close/rebuild).
         this.cache.clear();
         this.globalCacheEpoch += 1;
         this.cacheEpochs.clear();
-        this.inFlight.clear();
+        const previousScheduler = this.readScheduler;
+        const previousReady = this.readSchedulerReady;
+        this.readScheduler = this.createReadScheduler();
+        this.readSchedulerReady = Promise.all([previousReady ?? Promise.resolve(), previousScheduler.shutdown()]).then(() => undefined);
     }
 
     deleteFromCache(path: string): void {
@@ -177,7 +197,6 @@ export class FeatureImageBlobStore {
         // Bumping the epoch prevents older in-flight reads from re-populating the LRU.
         this.cache.delete(path);
         this.bumpCacheEpoch(path);
-        this.dropInFlightForPath(path);
     }
 
     moveCacheEntry(oldPath: string, newPath: string): void {
@@ -189,15 +208,20 @@ export class FeatureImageBlobStore {
         this.cache.move(oldPath, newPath, remappedKey ?? undefined);
         this.bumpCacheEpoch(oldPath);
         this.bumpCacheEpoch(newPath);
-        this.dropInFlightForPath(oldPath);
-        this.dropInFlightForPath(newPath);
     }
 
     seedCacheEntry(path: string, featureImageKey: string, blob: Blob): void {
         this.cache.set(path, { featureImageKey, blob });
     }
 
-    async getBlob(db: IDBDatabase, path: string, expectedKey: string): Promise<Blob | null> {
+    getMemoryCacheStats(): { entries: number; bytes: number } {
+        return { entries: this.cache.getEntryCount(), bytes: this.cache.getTotalBytes() };
+    }
+
+    async getBlob(db: IDBDatabase, path: string, expectedKey: string, options?: FeatureImageBlobReadOptions): Promise<Blob | null> {
+        if (options?.signal?.aborted) {
+            throw makeAbortError();
+        }
         // Empty keys are treated as "no reference selected" and never have blobs.
         if (!expectedKey) {
             return null;
@@ -209,47 +233,32 @@ export class FeatureImageBlobStore {
             return cached;
         }
 
-        // Deduplicate concurrent reads for the same path+key.
-        const inFlightByKey = this.inFlight.get(path);
-        const inFlight = inFlightByKey?.get(expectedKey) ?? null;
-        if (inFlight) {
-            return inFlight;
+        // A cache-generation replacement aborts the previous scheduler. Do not admit work to the
+        // replacement until the old generation has drained its IndexedDB transactions.
+        if (this.readSchedulerReady) {
+            await this.readSchedulerReady;
+        }
+        if (options?.signal?.aborted) {
+            throw makeAbortError();
         }
 
-        // Snapshot the epoch so we can avoid caching stale results after invalidation.
+        // Epochs are part of the dedup key, so invalidated reads can never join new callers.
         const cacheEpoch = this.getCacheEpoch(path);
         const globalCacheEpoch = this.globalCacheEpoch;
-        const request = this.readBlobFromStore(db, path, expectedKey)
-            .then(blob => {
-                // Only insert into the LRU when the cache has not been invalidated
-                // since this read started.
-                if (blob && this.globalCacheEpoch === globalCacheEpoch && this.getCacheEpoch(path) === cacheEpoch) {
-                    this.cache.set(path, { featureImageKey: expectedKey, blob });
-                }
-                return blob;
-            })
-            .finally(() => {
-                // Always remove the in-flight entry so later reads can retry.
-                const byKey = this.inFlight.get(path);
-                if (!byKey) {
-                    return;
-                }
-                const currentRequest = byKey.get(expectedKey);
-                if (currentRequest !== request) {
-                    return;
-                }
-                byKey.delete(expectedKey);
-                if (byKey.size === 0) {
-                    this.inFlight.delete(path);
-                }
-            });
+        const scheduler = this.readScheduler;
+        const blob = await scheduler.schedule({
+            key: `${globalCacheEpoch}:${cacheEpoch}:${path}\u0000${expectedKey}`,
+            priority: options?.priority ?? 'background',
+            weights: {},
+            signal: options?.signal,
+            execute: signal => this.readBlobFromStore(db, path, expectedKey, signal)
+        });
 
-        const updatedInFlightByKey = inFlightByKey ?? new Map<string, Promise<Blob | null>>();
-        updatedInFlightByKey.set(expectedKey, request);
-        if (!inFlightByKey) {
-            this.inFlight.set(path, updatedInFlightByKey);
+        // Only insert into the LRU when the cache has not been invalidated since this read started.
+        if (blob && this.globalCacheEpoch === globalCacheEpoch && this.getCacheEpoch(path) === cacheEpoch) {
+            this.cache.set(path, { featureImageKey: expectedKey, blob });
         }
-        return request;
+        return blob;
     }
 
     async forEachBlobRecord(db: IDBDatabase, callback: (path: string, record: FeatureImageBlobRecord) => void): Promise<void> {
@@ -462,7 +471,7 @@ export class FeatureImageBlobStore {
         this.deleteFromCache(path);
     }
 
-    protected async readBlobFromStore(db: IDBDatabase, path: string, expectedKey: string): Promise<Blob | null> {
+    protected async readBlobFromStore(db: IDBDatabase, path: string, expectedKey: string, signal?: AbortSignal): Promise<Blob | null> {
         // Reads a single record from the dedicated blob store.
         //
         // The record is considered valid only when:
@@ -473,15 +482,51 @@ export class FeatureImageBlobStore {
         const store = transaction.objectStore(FEATURE_IMAGE_STORE_NAME);
         const op = 'getFeatureImageBlob';
 
-        return new Promise(resolve => {
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (blob: Blob | null, error?: Error): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                window.clearTimeout(timeoutId);
+                signal?.removeEventListener('abort', handleAbort);
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve(blob);
+                }
+            };
+            const abortTransaction = (): void => {
+                try {
+                    transaction.abort();
+                } catch {
+                    // The transaction may already have completed between the signal and this callback.
+                }
+            };
+            const handleAbort = (): void => {
+                abortTransaction();
+                finish(null, makeAbortError());
+            };
+            const timeoutId = window.setTimeout(() => {
+                abortTransaction();
+                finish(null);
+            }, this.storeOptions.readTimeoutMs);
+
+            if (signal?.aborted) {
+                handleAbort();
+                return;
+            }
+            signal?.addEventListener('abort', handleAbort, { once: true });
+
             const request = store.get(path);
             request.onsuccess = () => {
                 const record = request.result as FeatureImageBlobRecord | undefined;
                 if (!record || record.featureImageKey !== expectedKey || !(record.blob instanceof Blob) || record.blob.size === 0) {
-                    resolve(null);
+                    finish(null);
                     return;
                 }
-                resolve(record.blob);
+                finish(record.blob);
             };
             request.onerror = () => {
                 console.error('[IndexedDB] get failed', {
@@ -491,7 +536,7 @@ export class FeatureImageBlobStore {
                     name: request.error?.name,
                     message: request.error?.message
                 });
-                resolve(null);
+                finish(null);
             };
         });
     }
@@ -506,9 +551,14 @@ export class FeatureImageBlobStore {
         this.cacheEpochs.set(path, this.getCacheEpoch(path) + 1);
     }
 
-    private dropInFlightForPath(path: string): void {
-        // Drop all in-flight reads for this path (regardless of expectedKey).
-        this.inFlight.delete(path);
+    private createReadScheduler(): ContentWorkScheduler {
+        return new ContentWorkScheduler({
+            activeJobs: this.storeOptions.maxConcurrentReads,
+            sourceBytes: 0,
+            decodedPixels: 0,
+            pdfSlots: 0,
+            externalSlots: 0
+        });
     }
 
     private getCachedFeatureImageKey(path: string): string | null {

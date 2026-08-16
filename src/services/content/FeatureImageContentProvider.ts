@@ -21,7 +21,7 @@ import { type ContentProviderType } from '../../interfaces/IContentProvider';
 import type { FeatureImagePixelSizeSetting, NotebookNavigatorSettings } from '../../settings/types';
 import { FileData } from '../../storage/IndexedDBStorage';
 import { getDBInstance } from '../../storage/fileOperations';
-import { isGeneratedThumbnailFile, isPdfFile } from '../../utils/fileTypeUtils';
+import { isGeneratedThumbnailFile, isPdfFile, isRasterImageFile } from '../../utils/fileTypeUtils';
 import { getYoutubeThumbnailUrl } from '../../utils/youtubeUtils';
 import { BaseContentProvider, type ContentProviderProcessResult } from './BaseContentProvider';
 import type { ContentReadCache } from './ContentReadCache';
@@ -32,6 +32,9 @@ import { decodeSvgSourceText, prepareSvgFeatureImageSource } from './thumbnail/s
 import { createOnceLogger, createRenderBudgetLimiter, createRenderLimiter } from './thumbnail/thumbnailRuntimeUtils';
 import { LIMITS } from '../../constants/limits';
 import { getDrawingDirectFeatureImageKey, getDrawingFeatureImageSource } from '../../utils/drawingFeatureImages';
+import { getLocalFeatureImageKey } from '../../utils/featureImageKey';
+
+export { getLocalFeatureImageKey } from '../../utils/featureImageKey';
 
 type FeatureImageThumbnailDimensions = {
     width: number;
@@ -129,8 +132,8 @@ export function createFeatureImageThumbnailRuntime(): FeatureImageThumbnailRunti
     };
 }
 
-export function getLocalFeatureImageKey(file: TFile): string {
-    return `f:${file.path}@${file.stat.mtime}`;
+function isBoundedThumbnailFile(file: TFile): boolean {
+    return isGeneratedThumbnailFile(file) || isRasterImageFile(file);
 }
 
 /**
@@ -211,9 +214,9 @@ export class FeatureImageContentProvider extends BaseContentProvider {
 
         const fileModified = fileData !== null && fileData.fileThumbnailsMtime !== file.stat.mtime;
 
-        if (isGeneratedThumbnailFile(file)) {
-            // PDFs and SVGs can have generated thumbnails; changes need reprocessing.
-            const expectedKey = this.getFeatureImageKey({ kind: 'local', file });
+        if (isBoundedThumbnailFile(file)) {
+            // PDFs, SVGs, and direct raster rows use bounded generated thumbnails.
+            const expectedKey = this.getFeatureImageKey({ kind: 'local', file }, settings.featureImagePixelSize);
             return (
                 fileModified ||
                 !fileData ||
@@ -252,10 +255,10 @@ export class FeatureImageContentProvider extends BaseContentProvider {
             return { update: null, processed: true };
         }
 
-        // Generate thumbnails for PDF files (first page cover) and SVG files (rasterized vector)
-        if (isGeneratedThumbnailFile(job.file)) {
+        // Generate bounded thumbnails for PDFs, SVGs, and direct raster image rows.
+        if (isBoundedThumbnailFile(job.file)) {
             const reference: FeatureImageReference = { kind: 'local', file: job.file };
-            const featureImageKey = this.getFeatureImageKey(reference);
+            const featureImageKey = this.getFeatureImageKey(reference, settings.featureImagePixelSize);
 
             // `featureImageKey` is the durable marker for the selected source (it includes the file mtime).
             // Forced provider-mtime resets must still re-render thumbnails when `fileThumbnailsMtime` is stale.
@@ -302,10 +305,10 @@ export class FeatureImageContentProvider extends BaseContentProvider {
         return new Blob([]);
     }
 
-    protected getFeatureImageKey(reference: FeatureImageReference): string {
+    protected getFeatureImageKey(reference: FeatureImageReference, pixelSize: FeatureImagePixelSizeSetting = '256'): string {
         if (reference.kind === 'local') {
             // Local references include the source mtime so edits to the image invalidate the key.
-            return getLocalFeatureImageKey(reference.file);
+            return getLocalFeatureImageKey(reference.file, pixelSize);
         }
 
         if (reference.kind === 'external') {
@@ -724,6 +727,17 @@ export class FeatureImageContentProvider extends BaseContentProvider {
 
         const { display: displayDimensions, coded: codedDimensions } = dimensionsPair;
         const pixelCount = codedDimensions.width * codedDimensions.height;
+        const maxSourceImagePixels = Platform.isMobile
+            ? LIMITS.thumbnails.featureImage.maxSourceImagePixels.mobile
+            : LIMITS.thumbnails.featureImage.maxSourceImagePixels.desktop;
+
+        if (!Number.isFinite(pixelCount) || pixelCount <= 0 || pixelCount > maxSourceImagePixels) {
+            this.thumbnailRuntime.logOnce(
+                `featureImage-source-pixel-skip:${effectiveMimeType}:${codedDimensions.width}x${codedDimensions.height}:${source}`,
+                `[${source}] Skipping ${effectiveMimeType} (${codedDimensions.width}x${codedDimensions.height}, ${pixelCount} px) - source capped at ${maxSourceImagePixels} px`
+            );
+            return null;
+        }
 
         const maxFallbackPixels = Platform.isMobile
             ? LIMITS.thumbnails.featureImage.maxFallbackPixels.mobile

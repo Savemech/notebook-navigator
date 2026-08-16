@@ -18,6 +18,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { createOnceLogger, createRenderBudgetLimiter } from '../../src/services/content/thumbnail/thumbnailRuntimeUtils';
+import { LIMITS } from '../../src/constants/limits';
 
 describe('createOnceLogger', () => {
     it('logs a key once and evicts old keys', () => {
@@ -96,5 +97,20 @@ describe('createRenderBudgetLimiter', () => {
 
         releaseOverweight();
         expect(limiter.getActiveWeight()).toBe(0);
+    });
+
+    it('uses finite decode budgets with valid per-image bounds on every platform', () => {
+        const featureImageLimits = LIMITS.thumbnails.featureImage;
+
+        for (const platform of ['mobile', 'desktop'] as const) {
+            const fallback = featureImageLimits.maxFallbackPixels[platform];
+            const perImage = featureImageLimits.maxSourceImagePixels[platform];
+            const shared = featureImageLimits.imageDecodeBudgetPixels[platform];
+
+            expect(Number.isFinite(shared)).toBe(true);
+            expect(shared).toBeLessThan(Number.MAX_SAFE_INTEGER);
+            expect(fallback).toBeLessThanOrEqual(perImage);
+            expect(perImage).toBeLessThanOrEqual(shared);
+        }
     });
 });

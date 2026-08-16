@@ -23,9 +23,29 @@ import { getCachedFileTags } from '../../utils/tagUtils';
 import { isRasterImageFile } from '../../utils/fileTypeUtils';
 import { arePropertyItemsEqual, clonePropertyItems } from '../../utils/propertyUtils';
 import { areStringArraysEqual } from '../../utils/arrayUtils';
-import { getVersionedResourcePath } from '../../utils/resourcePath';
+import { getLocalFeatureImageKey } from '../../utils/featureImageKey';
+import type { FeatureImagePixelSizeSetting } from '../../settings/types';
 
 const FEATURE_IMAGE_REGEN_THROTTLE_MS = 10000;
+
+export function shouldRequestDirectImageThumbnail({
+    shouldLoadFeatureImage,
+    featureImageStatus,
+    expectedKey,
+    lastRequest,
+    now
+}: {
+    shouldLoadFeatureImage: boolean;
+    featureImageStatus: FeatureImageStatus;
+    expectedKey: string;
+    lastRequest: { key: string; at: number } | null;
+    now: number;
+}): boolean {
+    if (!shouldLoadFeatureImage || featureImageStatus !== 'unprocessed') {
+        return false;
+    }
+    return !lastRequest || lastRequest.key !== expectedKey || now - lastRequest.at >= FEATURE_IMAGE_REGEN_THROTTLE_MS;
+}
 
 export type FileItemContentDb = Pick<
     IndexedDBStorage,
@@ -65,6 +85,7 @@ export interface UseFileItemContentStateParams {
     showImage: boolean;
     skipFeatureImage?: boolean;
     fileStatMtime?: number;
+    featureImagePixelSize?: FeatureImagePixelSizeSetting;
     getDB: () => FileItemContentDb;
     regenerateFeatureImageForFile: (file: TFile) => Promise<void>;
     loadOptions?: FileItemContentLoadOptions;
@@ -128,6 +149,36 @@ function resolveFileItemContentLoadOptions(loadOptions?: FileItemContentLoadOpti
     };
 }
 
+export function resolveViewportGatedLoadOptions(
+    loadOptions: FileItemContentLoadOptions | undefined,
+    hydrationLevel: 'shell' | 'metadata' | 'visible'
+): ResolvedFileItemContentLoadOptions {
+    const resolved = resolveFileItemContentLoadOptions(loadOptions);
+    if (hydrationLevel === 'visible') {
+        return resolved;
+    }
+    if (hydrationLevel === 'metadata') {
+        return {
+            ...resolved,
+            loadPreviewText: false,
+            loadFeatureImage: false
+        };
+    }
+    return {
+        loadPreviewText: false,
+        loadTags: false,
+        loadFeatureImage: false,
+        loadProperties: false,
+        loadWordCount: false,
+        loadCharacterCount: false,
+        loadTaskCounts: false
+    };
+}
+
+export function isAbortError(error: unknown): boolean {
+    return typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError';
+}
+
 export function loadFileItemCacheSnapshot({
     app,
     file,
@@ -135,6 +186,7 @@ export function loadFileItemCacheSnapshot({
     showImage,
     skipFeatureImage,
     fileStatMtime = file.stat.mtime,
+    featureImagePixelSize = '256',
     db,
     loadOptions
 }: {
@@ -144,6 +196,7 @@ export function loadFileItemCacheSnapshot({
     showImage: boolean;
     skipFeatureImage?: boolean;
     fileStatMtime?: number;
+    featureImagePixelSize?: FeatureImagePixelSizeSetting;
     db: FileItemContentDb;
     loadOptions?: FileItemContentLoadOptions;
 }): FileItemCacheSnapshot {
@@ -167,13 +220,13 @@ export function loadFileItemCacheSnapshot({
     const record = shouldReadFileRecord ? db.getFile(file.path) : null;
     const tags = shouldLoadTags ? [...getCachedFileTags({ app, file, db, fileData: record })] : [];
     const isDirectImageFile = shouldLoadFeatureImage && showImage && !skipFeatureImage && isRasterImageFile(file);
-    const featureImageKey =
-        shouldLoadFeatureImage && record?.featureImageKey
-            ? record.featureImageKey
-            : isDirectImageFile
-              ? `direct-image:${file.path}@${fileStatMtime}`
-              : null;
-    const featureImageStatus: FeatureImageStatus = shouldLoadFeatureImage ? (record?.featureImageStatus ?? 'unprocessed') : 'unprocessed';
+    const directImageKey = isDirectImageFile ? getLocalFeatureImageKey(file, featureImagePixelSize) : null;
+    const featureImageKey = directImageKey ?? (shouldLoadFeatureImage ? (record?.featureImageKey ?? null) : null);
+    const featureImageStatus: FeatureImageStatus = shouldLoadFeatureImage
+        ? directImageKey && record?.featureImageKey !== directImageKey
+            ? 'unprocessed'
+            : (record?.featureImageStatus ?? 'unprocessed')
+        : 'unprocessed';
     const properties = shouldLoadProperties ? clonePropertyItems(record?.properties ?? null) : null;
     const wordCount = shouldLoadWordCount ? (record?.wordCount ?? null) : null;
     const characterCountWithSpaces = shouldLoadCharacterCount ? (record?.characterCountWithSpaces ?? null) : null;
@@ -181,21 +234,12 @@ export function loadFileItemCacheSnapshot({
     const taskTotal = shouldLoadTaskCounts ? (record?.taskTotal ?? null) : null;
     const taskUnfinished = shouldLoadTaskCounts ? (record?.taskUnfinished ?? null) : null;
 
-    let featureImageUrl: string | null = null;
-    if (isDirectImageFile) {
-        try {
-            featureImageUrl = getVersionedResourcePath(app, file, fileStatMtime);
-        } catch {
-            featureImageUrl = null;
-        }
-    }
-
     return {
         previewText: preview,
         tags,
         featureImageKey,
         featureImageStatus,
-        featureImageUrl,
+        featureImageUrl: null,
         properties,
         wordCount,
         characterCountWithSpaces,
@@ -369,6 +413,7 @@ export function useFileItemContentState({
     showImage,
     skipFeatureImage = false,
     fileStatMtime = file.stat.mtime,
+    featureImagePixelSize = '256',
     getDB,
     regenerateFeatureImageForFile,
     loadOptions,
@@ -411,6 +456,14 @@ export function useFileItemContentState({
         loadCharacterCount: shouldLoadCharacterCount,
         loadTaskCounts: shouldLoadTaskCounts
     } = resolvedLoadOptions;
+    const shouldSubscribeToContent =
+        shouldLoadPreviewText ||
+        shouldLoadTags ||
+        shouldLoadFeatureImage ||
+        shouldLoadProperties ||
+        shouldLoadWordCount ||
+        shouldLoadCharacterCount ||
+        shouldLoadTaskCounts;
     const loadSnapshot = useCallback(() => {
         return loadFileItemCacheSnapshot({
             app,
@@ -419,10 +472,11 @@ export function useFileItemContentState({
             showImage,
             skipFeatureImage,
             fileStatMtime,
+            featureImagePixelSize,
             db: getDB(),
             loadOptions: resolvedLoadOptions
         });
-    }, [app, file, fileStatMtime, getDB, resolvedLoadOptions, showImage, showPreview, skipFeatureImage]);
+    }, [app, featureImagePixelSize, file, fileStatMtime, getDB, resolvedLoadOptions, showImage, showPreview, skipFeatureImage]);
 
     const initialDataRef = useRef<FileItemCacheSnapshot | null>(null);
     const initialData = initialDataRef.current ?? loadSnapshot();
@@ -434,6 +488,9 @@ export function useFileItemContentState({
     const featureImageObjectUrlRef = useRef<string | null>(null);
     const lastFeatureImageRegenRef = useRef<{ key: string; at: number } | null>(null);
     useLayoutEffect(() => {
+        if (!shouldSubscribeToContent) {
+            return;
+        }
         const db = getDB();
         const unsubscribe = subscribeToFileItemContentState({
             db,
@@ -487,6 +544,7 @@ export function useFileItemContentState({
         shouldLoadTags,
         shouldLoadTaskCounts,
         shouldLoadWordCount,
+        shouldSubscribeToContent,
         refreshMetadataVersionOnFeatureImageChange,
         showPreview
     ]);
@@ -515,20 +573,25 @@ export function useFileItemContentState({
             };
         }
 
-        if (isRasterImageFile(file)) {
-            try {
-                setFeatureImageUrl(getVersionedResourcePath(app, file, fileStatMtime));
-            } catch {
-                setFeatureImageUrl(null);
-            }
-
-            return () => {
-                isActive = false;
-            };
-        }
-
         if (box.featureImageStatus !== 'has' || !box.featureImageKey) {
             setFeatureImageUrl(null);
+            if (isRasterImageFile(file)) {
+                const expectedKey = getLocalFeatureImageKey(file, featureImagePixelSize);
+                const now = Date.now();
+                const last = lastFeatureImageRegenRef.current;
+                if (
+                    shouldRequestDirectImageThumbnail({
+                        shouldLoadFeatureImage,
+                        featureImageStatus: box.featureImageStatus,
+                        expectedKey,
+                        lastRequest: last,
+                        now
+                    })
+                ) {
+                    lastFeatureImageRegenRef.current = { key: expectedKey, at: now };
+                    void regenerateFeatureImageForFile(file);
+                }
+            }
             return () => {
                 isActive = false;
             };
@@ -536,30 +599,39 @@ export function useFileItemContentState({
 
         const db = getDB();
         const expectedKey = box.featureImageKey;
-        void db.getFeatureImageBlob(file.path, expectedKey).then(blob => {
-            if (!isActive) {
-                return;
-            }
-
-            if (!blob) {
-                setFeatureImageUrl(null);
-                const now = Date.now();
-                const last = lastFeatureImageRegenRef.current;
-                const shouldTrigger = !last || last.key !== expectedKey || now - last.at >= FEATURE_IMAGE_REGEN_THROTTLE_MS;
-                if (shouldTrigger) {
-                    lastFeatureImageRegenRef.current = { key: expectedKey, at: now };
-                    void regenerateFeatureImageForFile(file);
+        const controller = new AbortController();
+        void db
+            .getFeatureImageBlob(file.path, expectedKey, { signal: controller.signal, priority: 'visible' })
+            .then(blob => {
+                if (!isActive) {
+                    return;
                 }
-                return;
-            }
 
-            const nextUrl = URL.createObjectURL(blob);
-            featureImageObjectUrlRef.current = nextUrl;
-            setFeatureImageUrl(nextUrl);
-        });
+                if (!blob) {
+                    setFeatureImageUrl(null);
+                    const now = Date.now();
+                    const last = lastFeatureImageRegenRef.current;
+                    const shouldTrigger = !last || last.key !== expectedKey || now - last.at >= FEATURE_IMAGE_REGEN_THROTTLE_MS;
+                    if (shouldTrigger) {
+                        lastFeatureImageRegenRef.current = { key: expectedKey, at: now };
+                        void regenerateFeatureImageForFile(file);
+                    }
+                    return;
+                }
+
+                const nextUrl = URL.createObjectURL(blob);
+                featureImageObjectUrlRef.current = nextUrl;
+                setFeatureImageUrl(nextUrl);
+            })
+            .catch(error => {
+                if (!isAbortError(error)) {
+                    console.error(`Failed to load feature image for ${file.path}:`, error);
+                }
+            });
 
         return () => {
             isActive = false;
+            controller.abort();
         };
     }, [
         app,
@@ -567,6 +639,7 @@ export function useFileItemContentState({
         box.featureImageStatus,
         file,
         fileStatMtime,
+        featureImagePixelSize,
         getDB,
         regenerateFeatureImageForFile,
         shouldLoadFeatureImage,

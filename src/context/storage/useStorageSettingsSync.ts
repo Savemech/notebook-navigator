@@ -19,7 +19,7 @@
 import { useCallback, useEffect, useRef, type MutableRefObject } from 'react';
 import type { TFile } from 'obsidian';
 import { TIMEOUTS } from '../../types/obsidian-extended';
-import type { ContentProviderType, FileContentType } from '../../interfaces/IContentProvider';
+import type { ContentProviderType, ContentWorkPriority, FileContentType } from '../../interfaces/IContentProvider';
 import type { ContentProviderRegistry } from '../../services/content/ContentProviderRegistry';
 import type { NotebookNavigatorSettings } from '../../settings/types';
 import { calculateFileDiff } from '../../storage/diffCalculator';
@@ -68,7 +68,8 @@ export function useStorageSettingsSync(params: {
     queueMetadataContentWhenReady: (
         files: TFile[],
         includeTypes?: ContentProviderType[],
-        settingsOverride?: NotebookNavigatorSettings
+        settingsOverride?: NotebookNavigatorSettings,
+        priority?: ContentWorkPriority
     ) => void;
     queueIndexableFilesForContentGeneration: (files: TFile[], settings: NotebookNavigatorSettings) => { markdownFiles: TFile[] };
     queueIndexableFilesNeedingContentGeneration: (filesToCheck: TFile[], allFiles: TFile[], settings: NotebookNavigatorSettings) => void;

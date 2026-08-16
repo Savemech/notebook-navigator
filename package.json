@@ -17,6 +17,7 @@
     "lint:styles": "npm run build:styles && stylelint \"src/styles/**/*.css\" \"styles.css\" --max-warnings=0",
     "test": "vitest run",
     "test:watch": "vitest",
+    "perf:model": "node scripts/perf/run-performance-model.mjs",
     "lint:fix": "eslint \"src/**/*.{ts,tsx}\" \"tests/**/*.{ts,tsx}\" --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

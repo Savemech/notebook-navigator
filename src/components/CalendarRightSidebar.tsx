@@ -5,9 +5,8 @@ import { useSettingsState } from '../context/SettingsContext';
 import { isStorageRuntimeActive, subscribeStorageRuntimeActive } from '../context/StorageContext';
 import { runAsyncAction } from '../utils/async';
 import { getDBInstance } from '../storage/fileOperations';
-import { ContentProviderRegistry } from '../services/content/ContentProviderRegistry';
-import { ContentReadCache } from '../services/content/ContentReadCache';
-import { getMarkdownPipelineClearFlags, MarkdownPipelineContentProvider } from '../services/content/MarkdownPipelineContentProvider';
+import type { ContentProviderRuntimeSession } from '../services/content/ContentProviderRuntime';
+import { getMarkdownPipelineClearFlags } from '../services/content/MarkdownPipelineContentProvider';
 import { NotebookNavigatorView } from '../view/NotebookNavigatorView';
 import { Calendar } from './calendar';
 import type { CalendarFeatureImageTarget } from './calendar/useCalendarFeatureImages';
@@ -19,21 +18,18 @@ export function CalendarRightSidebar() {
     const latestSettingsRef = useRef(settings);
     latestSettingsRef.current = settings;
     const previousSettingsRef = useRef(settings);
-    const calendarContentRegistryRef = useRef<ContentProviderRegistry | null>(null);
+    const calendarContentRuntimeSessionRef = useRef<ContentProviderRuntimeSession | null>(null);
     const visibleCalendarNoteFilesRef = useRef<TFile[]>([]);
     const visibleCalendarNotePathsRef = useRef<Set<string>>(new Set());
     const [storageRuntimeActive, setStorageRuntimeActive] = useState(() => isStorageRuntimeActive());
 
     const getCalendarContentRegistry = useCallback(() => {
-        if (!calendarContentRegistryRef.current) {
-            const readCache = new ContentReadCache(app);
-            const registry = new ContentProviderRegistry();
-            registry.registerProvider(new MarkdownPipelineContentProvider(app, readCache));
-            calendarContentRegistryRef.current = registry;
+        if (!calendarContentRuntimeSessionRef.current) {
+            calendarContentRuntimeSessionRef.current = plugin.acquireContentProviderRuntime();
         }
 
-        return calendarContentRegistryRef.current;
-    }, [app]);
+        return calendarContentRuntimeSessionRef.current.registry;
+    }, [plugin]);
 
     const queueCalendarContentRefresh = useCallback(
         (files: TFile[]) => {
@@ -58,8 +54,8 @@ export function CalendarRightSidebar() {
 
         return () => {
             isMountedRef.current = false;
-            calendarContentRegistryRef.current?.stopAllProcessing();
-            calendarContentRegistryRef.current = null;
+            calendarContentRuntimeSessionRef.current?.release();
+            calendarContentRuntimeSessionRef.current = null;
         };
     }, []);
 
@@ -67,7 +63,8 @@ export function CalendarRightSidebar() {
 
     useEffect(() => {
         if (storageRuntimeActive) {
-            calendarContentRegistryRef.current?.stopAllProcessing();
+            calendarContentRuntimeSessionRef.current?.release();
+            calendarContentRuntimeSessionRef.current = null;
             return;
         }
 
@@ -120,7 +117,7 @@ export function CalendarRightSidebar() {
             return;
         }
 
-        const registry = calendarContentRegistryRef.current;
+        const registry = calendarContentRuntimeSessionRef.current?.registry;
         registry?.stopAllProcessing();
         runAsyncAction(async () => {
             await registry?.getProvider('markdownPipeline')?.waitForIdle();

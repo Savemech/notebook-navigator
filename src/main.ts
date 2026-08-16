@@ -50,6 +50,9 @@ import type { NavigateToFolderOptions } from './hooks/useNavigatorReveal';
 import ReleaseCheckService, { type ReleaseUpdateNotice } from './services/ReleaseCheckService';
 import { isNotebookNavigatorCalendarView, isNotebookNavigatorView } from './view/viewGuards';
 import { LEGACY_STORAGE_KEYS, localStorage } from './utils/localStorage';
+import { setBenchmarkModeEnabled } from './services/diagnostics/PerformanceTelemetry';
+import { installForegroundInteractionMonitor } from './services/content/BackgroundWorkController';
+import { ContentProviderRuntime, type ContentProviderRuntimeSession } from './services/content/ContentProviderRuntime';
 import { INTERNAL_NOTEBOOK_NAVIGATOR_API, NotebookNavigatorAPI } from './api/NotebookNavigatorAPI';
 import { initializeDatabase, shutdownDatabase } from './storage/fileOperations';
 import { ExtendedApp } from './types/obsidian-extended';
@@ -75,6 +78,7 @@ import {
     type TagSortOrder
 } from './settings/types';
 import { NOTEBOOK_NAVIGATOR_ICON_ID, NOTEBOOK_NAVIGATOR_ICON_SVG } from './constants/notebookNavigatorIcon';
+import { LIMITS } from './constants/limits';
 import { PluginSettingsController, type SettingsLoadResult } from './services/settings/PluginSettingsController';
 import { PluginPreferencesController } from './services/settings/PluginPreferencesController';
 import { clearPendingPdfProcessingDiagnostic, consumePendingPdfProcessingDiagnostic } from './services/content/pdf/pdfCrashDiagnostics';
@@ -138,6 +142,7 @@ export default class NotebookNavigatorPlugin extends Plugin implements ISettings
     recentNotesService: RecentNotesService | null = null;
     releaseCheckService: ReleaseCheckService | null = null;
     debugLoggingService: DebugLoggingService | null = null;
+    private contentProviderRuntime: ContentProviderRuntime | null = null;
     // Keys used for persisting UI state in browser localStorage
     keys: LocalStorageKeys = STORAGE_KEYS;
     // Map of callbacks to notify open React views when settings change
@@ -147,6 +152,7 @@ export default class NotebookNavigatorPlugin extends Plugin implements ISettings
     private updateNoticeListeners = new Map<string, (notice: ReleaseUpdateNotice | null) => void>();
     // Flag indicating plugin is being unloaded to prevent operations during shutdown
     private isUnloading = false;
+    private shutdownPromise: Promise<void> | null = null;
     // Set when completeStartup finishes with established settings, from onload or from the user-enable recovery
     // that runs after onload; stays false while startup is aborted
     private hasStartedWithSettings = false;
@@ -192,6 +198,13 @@ export default class NotebookNavigatorPlugin extends Plugin implements ISettings
 
     public getSyncMode(settingId: SyncModeSettingId): SettingSyncMode {
         return this.settingsController.getSyncMode(settingId);
+    }
+
+    public acquireContentProviderRuntime(): ContentProviderRuntimeSession {
+        if (!this.contentProviderRuntime) {
+            throw new Error('Content provider runtime is not initialized');
+        }
+        return this.contentProviderRuntime.acquire();
     }
 
     public isLocal(settingId: SyncModeSettingId): boolean {
@@ -400,6 +413,32 @@ export default class NotebookNavigatorPlugin extends Plugin implements ISettings
     async onload() {
         // Initialize localStorage before database so version checks work
         localStorage.init(this.app);
+        if (typeof document !== 'undefined') {
+            const interactionMonitorCleanups = new Map<Document, () => void>();
+            const attachInteractionMonitor = (targetDocument: Document): void => {
+                if (!interactionMonitorCleanups.has(targetDocument)) {
+                    interactionMonitorCleanups.set(targetDocument, installForegroundInteractionMonitor(targetDocument));
+                }
+            };
+            const detachInteractionMonitor = (targetDocument: Document): void => {
+                interactionMonitorCleanups.get(targetDocument)?.();
+                interactionMonitorCleanups.delete(targetDocument);
+            };
+
+            attachInteractionMonitor(document);
+            this.registerEvent(
+                this.app.workspace.on('window-open', (_workspaceWindow, ownerWindow) => attachInteractionMonitor(ownerWindow.document))
+            );
+            this.registerEvent(
+                this.app.workspace.on('window-close', (_workspaceWindow, ownerWindow) => detachInteractionMonitor(ownerWindow.document))
+            );
+            this.register(() => {
+                interactionMonitorCleanups.forEach(cleanup => cleanup());
+                interactionMonitorCleanups.clear();
+            });
+        }
+        setBenchmarkModeEnabled(localStorage.get<boolean>(STORAGE_KEYS.benchmarkModeEnabledKey) === true);
+        this.contentProviderRuntime = new ContentProviderRuntime(this.app);
         this.debugLoggingService = new DebugLoggingService(this.app, { pluginVersion: this.manifest.version });
         setDebugLoggingService(this.debugLoggingService);
         this.debugLoggingService.initialize();
@@ -419,12 +458,16 @@ export default class NotebookNavigatorPlugin extends Plugin implements ISettings
         const appId = (this.app as ExtendedApp).appId || '';
         // Use a fixed per-platform LRU size for feature image blobs.
         const featureImageCacheMaxEntries = Platform.isMobile ? 200 : 1000;
+        const featureImageCacheMaxBytes = Platform.isMobile
+            ? LIMITS.storage.featureImageCacheMaxBytes.mobile
+            : LIMITS.storage.featureImageCacheMaxBytes.desktop;
         // Use a fixed per-platform LRU size for preview text strings.
         const previewTextCacheMaxEntries = Platform.isMobile ? 10000 : 50000;
         // Limit the number of preview text paths processed per load flush.
         const previewLoadMaxBatch = Platform.isMobile ? 20 : 50;
         recordStartupDiagnostic('database.init.scheduled', {
             featureImageCacheMaxEntries,
+            featureImageCacheMaxBytes,
             previewTextCacheMaxEntries,
             previewLoadMaxBatch
         });
@@ -432,7 +475,12 @@ export default class NotebookNavigatorPlugin extends Plugin implements ISettings
             async () => {
                 try {
                     recordStartupDiagnostic('database.init.start');
-                    await initializeDatabase(appId, { featureImageCacheMaxEntries, previewTextCacheMaxEntries, previewLoadMaxBatch });
+                    await initializeDatabase(appId, {
+                        featureImageCacheMaxEntries,
+                        featureImageCacheMaxBytes,
+                        previewTextCacheMaxEntries,
+                        previewLoadMaxBatch
+                    });
                     recordStartupDiagnostic('database.init.complete');
                 } catch (error: unknown) {
                     recordStartupDiagnostic('database.init.failed', { error });
@@ -1333,9 +1381,9 @@ export default class NotebookNavigatorPlugin extends Plugin implements ISettings
      * Guards against duplicate teardown and flushes critical services before
      * either Obsidian quits or the plugin unloads.
      */
-    private initiateShutdown(): void {
-        if (this.isUnloading) {
-            return;
+    private initiateShutdown(): Promise<void> {
+        if (this.shutdownPromise) {
+            return this.shutdownPromise;
         }
 
         this.isUnloading = true;
@@ -1359,23 +1407,34 @@ export default class NotebookNavigatorPlugin extends Plugin implements ISettings
             this.commandQueue.clearAllOperations();
         }
 
-        this.stopNavigatorContentProcessing();
-
-        shutdownDatabase();
+        const viewShutdownPromise = this.stopNavigatorContentProcessing();
+        const contentProviderRuntime = this.contentProviderRuntime;
+        this.contentProviderRuntime = null;
+        this.shutdownPromise = (async () => {
+            try {
+                await Promise.all([viewShutdownPromise, contentProviderRuntime?.dispose()]);
+            } catch (error) {
+                console.error('Failed to drain content runtime during shutdown:', error);
+            } finally {
+                shutdownDatabase();
+            }
+        })();
+        return this.shutdownPromise;
     }
 
     /**
      * Stops background processing inside every mounted navigator view to avoid
      * running content providers while shutdown is in progress.
      */
-    private stopNavigatorContentProcessing(): void {
+    private async stopNavigatorContentProcessing(): Promise<void> {
+        const pendingStops: Promise<void>[] = [];
         try {
             const navigatorLeaves = this.app.workspace.getLeavesOfType(NOTEBOOK_NAVIGATOR_VIEW);
             for (const leaf of navigatorLeaves) {
                 const view = leaf.view;
                 if (isNotebookNavigatorView(view)) {
                     // Halt preview/tag generation loops inside each React view
-                    view.stopContentProcessing();
+                    pendingStops.push(view.stopContentProcessing());
                 }
             }
 
@@ -1383,11 +1442,17 @@ export default class NotebookNavigatorPlugin extends Plugin implements ISettings
             for (const leaf of calendarLeaves) {
                 const view = leaf.view;
                 if (isNotebookNavigatorCalendarView(view)) {
-                    view.stopContentProcessing();
+                    pendingStops.push(Promise.resolve(view.stopContentProcessing()));
                 }
             }
         } catch (error) {
             console.error('Failed stopping content processing during shutdown:', error);
+        }
+        const results = await Promise.allSettled(pendingStops);
+        for (const result of results) {
+            if (result.status === 'rejected') {
+                console.error('Failed draining navigator view during shutdown:', result.reason);
+            }
         }
     }
 
@@ -1397,7 +1462,8 @@ export default class NotebookNavigatorPlugin extends Plugin implements ISettings
      * Per Obsidian guidelines: leaves should not be detached in onunload
      */
     onunload() {
-        this.initiateShutdown();
+        void this.initiateShutdown();
+        setBenchmarkModeEnabled(false);
         this.debugLoggingService?.dispose();
         setDebugLoggingService(null);
         this.debugLoggingService = null;

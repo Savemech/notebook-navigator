@@ -314,8 +314,8 @@ export class NotebookNavigatorView extends ItemView {
     /**
      * Stops all background content processing (providers) within this view's React tree
      */
-    stopContentProcessing() {
-        this.componentHandle?.stopContentProcessing();
+    stopContentProcessing(): Promise<void> {
+        return this.componentHandle?.stopContentProcessing() ?? Promise.resolve();
     }
 
     /**

@@ -142,6 +142,7 @@ describe('getImageDimensionsFromBuffer', () => {
         ]);
 
         expect(getImageDimensionsFromBuffer(bytes.buffer, 'image/jpeg')).toEqual({ width: 200, height: 300 });
+        expect(getImageCodedDimensionsFromBuffer(bytes.buffer, 'image/jpeg')).toEqual({ width: 300, height: 200 });
     });
 
     it('applies JPEG EXIF orientation (little endian)', () => {

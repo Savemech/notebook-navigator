@@ -25,6 +25,7 @@ import type { NotebookNavigatorSettings } from '../../src/settings/types';
 import type { FileData } from '../../src/storage/IndexedDBStorage';
 import { deriveFileMetadata } from '../utils/pathMetadata';
 import { getDrawingDirectFeatureImageKey } from '../../src/utils/drawingFeatureImages';
+import { LIMITS } from '../../src/constants/limits';
 
 const { requestUrlMock } = vi.hoisted(() => {
     return {
@@ -65,6 +66,22 @@ class TestFeatureImageContentProvider extends MarkdownPipelineContentProvider {
 }
 
 class TestNonMarkdownFeatureImageContentProvider extends FeatureImageContentProvider {
+    private thumbnailOverride: Blob | null | undefined;
+
+    setThumbnailOverride(thumbnail: Blob | null): void {
+        this.thumbnailOverride = thumbnail;
+    }
+
+    protected override async createThumbnailBlob(
+        reference: FeatureImageReference,
+        settings: NotebookNavigatorSettings
+    ): Promise<Blob | null> {
+        if (this.thumbnailOverride !== undefined) {
+            return this.thumbnailOverride;
+        }
+        return await super.createThumbnailBlob(reference, settings);
+    }
+
     async runProcessFile(file: TFile, settings: NotebookNavigatorSettings) {
         const result = await this.processFile({ file, path: file.path }, null, settings);
         return result.update;
@@ -248,6 +265,73 @@ function setMarkdownContent(
 }
 
 describe('FeatureImageContentProvider thumbnails', () => {
+    it('rejects oversized coded images before invoking the browser decoder', async () => {
+        const { app } = createApp();
+        const provider = new TestFeatureImageContentProvider(app);
+        const imageFile = createFile('images/oversized.png');
+        const sourceBytes = createPngHeaderBytes(10_000, 10_001);
+        imageFile.stat.size = sourceBytes.byteLength;
+        app.vault.adapter.readBinary = async () => copyBytesToArrayBuffer(sourceBytes);
+
+        const testWindow = window as Omit<Window, 'createImageBitmap'> & {
+            createImageBitmap?: (image: Blob, options?: ImageBitmapOptions) => Promise<ImageBitmap>;
+        };
+        const originalCreateImageBitmap = testWindow.createImageBitmap;
+        const createImageBitmapMock = vi.fn(async (): Promise<ImageBitmap> => {
+            throw new Error('decoder should not be called');
+        });
+        Object.defineProperty(testWindow, 'createImageBitmap', {
+            configurable: true,
+            value: createImageBitmapMock
+        });
+
+        try {
+            const thumbnail = await provider.createThumbnailForTest({ kind: 'local', file: imageFile }, createSettings());
+
+            expect(thumbnail).toBeNull();
+            expect(createImageBitmapMock).not.toHaveBeenCalled();
+            expect(LIMITS.thumbnails.featureImage.maxSourceImagePixels.desktop).toBe(100_000_000);
+        } finally {
+            Object.defineProperty(testWindow, 'createImageBitmap', {
+                configurable: true,
+                value: originalCreateImageBitmap
+            });
+        }
+    });
+
+    it('allows an image exactly at the coded-pixel cap to reach the resize decoder', async () => {
+        const { app } = createApp();
+        const provider = new TestFeatureImageContentProvider(app);
+        const imageFile = createFile('images/at-limit.png');
+        const sourceBytes = createPngHeaderBytes(10_000, 10_000);
+        imageFile.stat.size = sourceBytes.byteLength;
+        app.vault.adapter.readBinary = async () => copyBytesToArrayBuffer(sourceBytes);
+
+        const testWindow = window as Omit<Window, 'createImageBitmap'> & {
+            createImageBitmap?: (image: Blob, options?: ImageBitmapOptions) => Promise<ImageBitmap>;
+        };
+        const originalCreateImageBitmap = testWindow.createImageBitmap;
+        const createImageBitmapMock = vi.fn(async (): Promise<ImageBitmap> => {
+            throw new Error('test decoder failure after admission');
+        });
+        Object.defineProperty(testWindow, 'createImageBitmap', {
+            configurable: true,
+            value: createImageBitmapMock
+        });
+
+        try {
+            const thumbnail = await provider.createThumbnailForTest({ kind: 'local', file: imageFile }, createSettings());
+
+            expect(thumbnail).toBeNull();
+            expect(createImageBitmapMock).toHaveBeenCalledTimes(1);
+        } finally {
+            Object.defineProperty(testWindow, 'createImageBitmap', {
+                configurable: true,
+                value: originalCreateImageBitmap
+            });
+        }
+    });
+
     it('re-encodes local images that already fit thumbnail dimensions', async () => {
         const { app } = createApp();
         const provider = new TestFeatureImageContentProvider(app);
@@ -697,7 +781,7 @@ describe('FeatureImageContentProvider scanning', () => {
 
         const key = provider.buildKey({ kind: 'local', file: imageFile });
 
-        expect(key).toBe(`f:${imageFile.path}@${imageFile.stat.mtime}`);
+        expect(key).toBe(`f:${imageFile.path}@${imageFile.stat.mtime}:256`);
     });
 
     it('skips regeneration when featureImageKey matches even without a blob', async () => {
@@ -1009,9 +1093,25 @@ describe('FeatureImageContentProvider scanning', () => {
 
         // Rasterization requires DOM APIs unavailable in the node test environment,
         // so the empty processed marker is stored under the mtime-based local key.
-        expect(result?.featureImageKey).toBe(`f:${svgFile.path}@${svgFile.stat.mtime}`);
+        expect(result?.featureImageKey).toBe(`f:${svgFile.path}@${svgFile.stat.mtime}:256`);
         expect(result?.featureImage).toBeInstanceOf(Blob);
         expect(result?.featureImage?.size).toBe(0);
+    });
+
+    it('stores a bounded generated thumbnail for a direct raster file', async () => {
+        const { app } = createApp();
+        const provider = new TestNonMarkdownFeatureImageContentProvider(app);
+        const settings = createSettings({ featureImagePixelSize: '384' });
+        const imageFile = createFile('images/photo.jpg');
+        imageFile.stat.mtime = 4242;
+        const boundedThumbnail = new Blob(['bounded-thumbnail'], { type: 'image/webp' });
+        provider.setThumbnailOverride(boundedThumbnail);
+
+        expect(provider.shouldProcess(null, imageFile, settings)).toBe(true);
+        const result = await provider.runProcessFile(imageFile, settings);
+
+        expect(result?.featureImageKey).toBe('f:images/photo.jpg@4242:384');
+        expect(result?.featureImage).toBe(boundedThumbnail);
     });
 
     it('downloads extensionless external SVG responses after successful HEAD preflight', async () => {

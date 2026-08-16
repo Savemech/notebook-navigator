@@ -24,6 +24,7 @@ import { getListPaneMeasurements } from '../../src/utils/listPaneMeasurements';
 import { createHiddenTagVisibility } from '../../src/utils/tagPrefixMatcher';
 import type { FileContentChange, IndexedDBStorage } from '../../src/storage/IndexedDBStorage';
 import {
+    areFilePathIndexMapsEqual,
     createRemeasureScheduler,
     isPendingFileScrollStale,
     isListRowHeightAffectingContentChange,
@@ -50,6 +51,18 @@ function createFileItem(file: TFile, overrides: Partial<ListPaneItem> = {}): Lis
         ...overrides
     };
 }
+
+describe('file path index identity', () => {
+    it('treats recreated equivalent maps as the same effective topology', () => {
+        const previous = new Map([
+            ['notes/a.md', 1],
+            ['notes/b.md', 2]
+        ]);
+
+        expect(areFilePathIndexMapsEqual(previous, new Map(previous))).toBe(true);
+        expect(areFilePathIndexMapsEqual(previous, new Map([['notes/a.md', 2]]))).toBe(false);
+    });
+});
 
 function createRowSizingConfig(overrides: Partial<ListFileRowSizingConfig> = {}): ListFileRowSizingConfig {
     const showPreview = overrides.showPreview ?? true;

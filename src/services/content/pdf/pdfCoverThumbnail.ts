@@ -22,7 +22,13 @@ import { isPromiseLike } from '../../../utils/async';
 import { isRecord } from '../../../utils/typeGuards';
 import { createRenderLimiter } from '../thumbnail/thumbnailRuntimeUtils';
 import { clearPdfProcessingInProgress, markPdfProcessingInProgress } from './pdfCrashDiagnostics';
-import { preflightPdfCoverThumbnailStageA, preflightPdfCoverThumbnailStageB, type PdfByteScanMetrics } from './pdfPreflight';
+import {
+    isPdfSourceSizeAllowed,
+    isPdfViewportWithinPixelLimit,
+    preflightPdfCoverThumbnailStageA,
+    preflightPdfCoverThumbnailStageB,
+    type PdfByteScanMetrics
+} from './pdfPreflight';
 import { isDebugLoggingEnabled, recordDebugReport } from '../../diagnostics/DebugLoggingService';
 
 // Options for rendering a PDF cover page thumbnail
@@ -336,6 +342,13 @@ export async function renderPdfCoverThumbnail(app: App, pdfFile: TFile, options:
         return null;
     }
 
+    const maxSourceBytes = Platform.isMobile
+        ? LIMITS.thumbnails.pdf.maxSourceBytes.mobile
+        : LIMITS.thumbnails.pdf.maxSourceBytes.desktop;
+    if (!isPdfSourceSizeAllowed(pdfFile.stat.size, maxSourceBytes)) {
+        return null;
+    }
+
     const trace = createPdfThumbnailTrace(pdfFile.path);
     clearWorkerIdleTimer();
     const release = await renderLimiter.acquire();
@@ -455,6 +468,19 @@ export async function renderPdfCoverThumbnail(app: App, pdfFile: TFile, options:
         page = firstPage;
 
         const baseViewport = firstPage.getViewport({ scale: 1 });
+        const maxPageViewportPixels = Platform.isMobile
+            ? LIMITS.thumbnails.pdf.maxPageViewportPixels.mobile
+            : LIMITS.thumbnails.pdf.maxPageViewportPixels.desktop;
+        if (!isPdfViewportWithinPixelLimit(baseViewport.width, baseViewport.height, maxPageViewportPixels)) {
+            finishPdfTrace(trace, {
+                result: 'skipped',
+                skipReason: 'page.viewportOverPixelLimit',
+                width: baseViewport.width,
+                height: baseViewport.height,
+                maxPageViewportPixels
+            });
+            return null;
+        }
         const scale = calculateScale({
             baseWidth: baseViewport.width,
             baseHeight: baseViewport.height,

@@ -55,6 +55,10 @@ import {
     recordStartupUserVisible,
     setDebugLoggingService
 } from '../../src/services/diagnostics/DebugLoggingService';
+import {
+    resetPerformanceTelemetry,
+    setBenchmarkModeEnabled
+} from '../../src/services/diagnostics/PerformanceTelemetry';
 import { STORAGE_KEYS } from '../../src/types';
 
 function createApp(params?: { append?: (path: string, data: string) => Promise<void> }): App {
@@ -76,9 +80,13 @@ describe('DebugLoggingService', () => {
         vi.clearAllMocks();
         vi.spyOn(console, 'log').mockImplementation(() => undefined);
         setDebugLoggingService(null);
+        setBenchmarkModeEnabled(false);
+        resetPerformanceTelemetry();
     });
 
     afterEach(() => {
+        setBenchmarkModeEnabled(false);
+        resetPerformanceTelemetry();
         setDebugLoggingService(null);
         vi.restoreAllMocks();
         vi.useRealTimers();
@@ -253,5 +261,44 @@ describe('DebugLoggingService', () => {
         await service.flush();
 
         expect(append).toHaveBeenCalledTimes(1);
+    });
+
+    it('includes a performance snapshot in the startup raw report when benchmark mode is enabled', async () => {
+        mockLocalStorageStore.set(STORAGE_KEYS.debugLoggingEnabledKey, true);
+        setBenchmarkModeEnabled(true);
+        const append = vi.fn(async () => undefined);
+        const service = new DebugLoggingService(createApp({ append }), { pluginVersion: '1.0.0' });
+
+        service.initialize();
+        setDebugLoggingService(service);
+
+        finishStartupDiagnostics({ status: 'storageReady' });
+        recordStartupUserVisible({ source: 'layout.readyTasks.complete' });
+        await vi.advanceTimersByTimeAsync(2000);
+        await service.flush();
+
+        expect(append).toHaveBeenCalledTimes(1);
+        const text = append.mock.calls[0]?.[1] ?? '';
+        expect(text).toContain('"performanceSnapshot"');
+        expect(text).toContain('"enabled": true');
+    });
+
+    it('does not include a performance snapshot in the startup raw report when benchmark mode is disabled', async () => {
+        mockLocalStorageStore.set(STORAGE_KEYS.debugLoggingEnabledKey, true);
+        setBenchmarkModeEnabled(false);
+        const append = vi.fn(async () => undefined);
+        const service = new DebugLoggingService(createApp({ append }), { pluginVersion: '1.0.0' });
+
+        service.initialize();
+        setDebugLoggingService(service);
+
+        finishStartupDiagnostics({ status: 'storageReady' });
+        recordStartupUserVisible({ source: 'layout.readyTasks.complete' });
+        await vi.advanceTimersByTimeAsync(2000);
+        await service.flush();
+
+        expect(append).toHaveBeenCalledTimes(1);
+        const text = append.mock.calls[0]?.[1] ?? '';
+        expect(text).not.toContain('"performanceSnapshot"');
     });
 });

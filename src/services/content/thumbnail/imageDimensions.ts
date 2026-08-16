@@ -234,8 +234,9 @@ function getImageDimensionsPairFromView(bytes: Uint8Array, view: DataView, mimeT
             return dimensions ? { display: dimensions, coded: dimensions } : null;
         }
         case 'image/jpeg': {
-            const dimensions = getJpegDimensions(bytes, view);
-            return dimensions ? { display: dimensions, coded: dimensions } : null;
+            const display = getJpegDimensions(bytes, view);
+            const coded = getJpegDimensions(bytes, view, false);
+            return display && coded ? { display, coded } : null;
         }
         case 'image/webp': {
             const dimensions = getWebpDimensions(bytes, view);
@@ -261,7 +262,7 @@ function getImageCodedDimensionsFromView(bytes: Uint8Array, view: DataView, mime
         case 'image/gif':
             return getGifDimensions(bytes, view);
         case 'image/jpeg':
-            return getJpegDimensions(bytes, view);
+            return getJpegDimensions(bytes, view, false);
         case 'image/webp':
             return getWebpDimensions(bytes, view);
         case 'image/bmp':
@@ -369,8 +370,9 @@ function getGifDimensions(bytes: Uint8Array, view: DataView): RasterDimensions |
     return { width, height };
 }
 
-// Parses JPEG dimensions by scanning for a Start of Frame (SOF) marker
-function getJpegDimensions(bytes: Uint8Array, view: DataView): RasterDimensions | null {
+// Parses JPEG dimensions by scanning for a Start of Frame (SOF) marker.
+// Decode-safety callers can opt out of EXIF display rotation to retain coded geometry.
+function getJpegDimensions(bytes: Uint8Array, view: DataView, applyOrientation = true): RasterDimensions | null {
     if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
         return null;
     }
@@ -512,7 +514,7 @@ function getJpegDimensions(bytes: Uint8Array, view: DataView): RasterDimensions 
         return null;
     }
 
-    if (orientation === 5 || orientation === 6 || orientation === 7 || orientation === 8) {
+    if (applyOrientation && (orientation === 5 || orientation === 6 || orientation === 7 || orientation === 8)) {
         return { width: height, height: width };
     }
 

@@ -51,6 +51,7 @@ let isShutdownState = false;
 let initializationPromise: Promise<void> | null = null;
 // Configured feature image blob cache size for the current platform.
 let featureImageCacheMaxEntries: number | null = null;
+let featureImageCacheMaxBytes: number | null = null;
 // Configured preview text LRU size for the current platform.
 let previewTextCacheMaxEntries: number | null = null;
 // Configured preview text load batch size for the current platform.
@@ -78,11 +79,15 @@ export function getDBInstance(): IndexedDBStorage {
         // Build the constructor options from the configured module-level settings.
         const options: {
             featureImageCacheMaxEntries?: number;
+            featureImageCacheMaxBytes?: number;
             previewTextCacheMaxEntries?: number;
             previewLoadMaxBatch?: number;
         } = {};
         if (featureImageCacheMaxEntries !== null) {
             options.featureImageCacheMaxEntries = featureImageCacheMaxEntries;
+        }
+        if (featureImageCacheMaxBytes !== null) {
+            options.featureImageCacheMaxBytes = featureImageCacheMaxBytes;
         }
         if (previewTextCacheMaxEntries !== null) {
             options.previewTextCacheMaxEntries = previewTextCacheMaxEntries;
@@ -119,6 +124,7 @@ export async function initializeDatabase(
     appIdParam: string,
     options?: {
         featureImageCacheMaxEntries?: number;
+        featureImageCacheMaxBytes?: number;
         previewTextCacheMaxEntries?: number;
         previewLoadMaxBatch?: number;
     }
@@ -159,6 +165,9 @@ export async function initializeDatabase(
             if (options?.featureImageCacheMaxEntries !== undefined) {
                 // Persist feature image cache size for the singleton instance.
                 featureImageCacheMaxEntries = options.featureImageCacheMaxEntries;
+            }
+            if (options?.featureImageCacheMaxBytes !== undefined) {
+                featureImageCacheMaxBytes = options.featureImageCacheMaxBytes;
             }
             if (options?.previewTextCacheMaxEntries !== undefined) {
                 previewTextCacheMaxEntries = options.previewTextCacheMaxEntries;

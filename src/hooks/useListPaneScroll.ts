@@ -236,7 +236,7 @@ interface UseListPaneScrollResult {
 }
 
 // Path-index maps can be recreated with the same contents. Keep indexVersion tied to effective mapping changes.
-function areFilePathIndexMapsEqual(previous: ReadonlyMap<string, number>, next: ReadonlyMap<string, number>): boolean {
+export function areFilePathIndexMapsEqual(previous: ReadonlyMap<string, number>, next: ReadonlyMap<string, number>): boolean {
     if (previous === next) {
         return true;
     }

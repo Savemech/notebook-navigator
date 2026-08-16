@@ -42,6 +42,7 @@ import { TFile, TFolder, setTooltip, setIcon } from 'obsidian';
 import { useServices } from '../context/ServicesContext';
 import { useMetadataService } from '../context/ServicesContext';
 import { useSettingsState } from '../context/SettingsContext';
+import { useNearViewportHydration } from '../hooks/useNearViewportHydration';
 import type { FolderDecorationModel } from '../utils/folderDecoration';
 import type { ListPaneAppearanceSettings } from '../settings/listPaneAppearance';
 import { strings } from '../i18n';
@@ -77,7 +78,11 @@ import type { FileNameIconNeedle } from '../utils/fileIconUtils';
 import type { FileItemPillDecorationModel } from '../utils/fileItemPillDecoration';
 import type { FileItemPillOrderModel } from '../utils/fileItemPillOrder';
 import type { HiddenTagVisibility } from '../utils/tagPrefixMatcher';
-import { useFileItemContentState, type FileItemContentDb } from './fileItem/useFileItemContentState';
+import {
+    resolveViewportGatedLoadOptions,
+    useFileItemContentState,
+    type FileItemContentDb
+} from './fileItem/useFileItemContentState';
 import { useFileItemPills } from './fileItem/useFileItemPills';
 import { renderTextWithHighlightRanges } from './fileItem/searchHighlightRendering';
 import { ServiceIcon } from './ServiceIcon';
@@ -458,6 +463,7 @@ export const FileItem = React.memo(function FileItem({
     } = paneProps;
     // === Hooks (all hooks together at the top) ===
     const { app, isMobile, plugin, commandQueue, fileSystemOps, tagOperations } = useServices();
+    const { hydrationRef: fileRef, hydrationLevel } = useNearViewportHydration(isSelected);
     const settings = useSettingsState();
     const metadataService = useMetadataService();
     const { getFileDisplayName, getDB, getFileTimestamps, hasPreview, regenerateFeatureImageForFile } = fileItemStorage;
@@ -494,7 +500,11 @@ export const FileItem = React.memo(function FileItem({
             settings.showFileBackgroundUnfinishedTask ||
             (!isMobile && settings.showTooltips));
     const shouldRefreshMetadataVersionOnFeatureImageChange = isMarkdownFile && appearanceSettings.showImage;
-    const fileStatMtime = useImageFileResourceVersion(app, file, appearanceSettings.showImage && isRasterImageFile(file));
+    const fileStatMtime = useImageFileResourceVersion(
+        app,
+        file,
+        hydrationLevel === 'visible' && appearanceSettings.showImage && isRasterImageFile(file)
+    );
     const drawingFeatureImageSource = getDrawingFeatureImageSource(app, file);
     const isDrawingFeatureImageRow = drawingFeatureImageSource !== null;
     const {
@@ -517,24 +527,28 @@ export const FileItem = React.memo(function FileItem({
         showImage: appearanceSettings.showImage,
         skipFeatureImage: isDrawingFeatureImageRow,
         fileStatMtime,
+        featureImagePixelSize: settings.featureImagePixelSize,
         getDB,
         regenerateFeatureImageForFile,
-        loadOptions: {
-            loadPreviewText: appearanceSettings.showPreview && isMarkdownFile && !searchMeta?.excerpt,
-            loadTags: shouldLoadTags,
-            loadFeatureImage: appearanceSettings.showImage && !isDrawingFeatureImageRow,
-            loadProperties: shouldLoadProperties,
-            loadWordCount: shouldLoadWordCount,
-            loadCharacterCount: shouldLoadCharacterCount,
-            loadTaskCounts: shouldLoadTaskCounts
-        },
+        loadOptions: resolveViewportGatedLoadOptions(
+            {
+                loadPreviewText: appearanceSettings.showPreview && isMarkdownFile && !searchMeta?.excerpt,
+                loadTags: shouldLoadTags,
+                loadFeatureImage: appearanceSettings.showImage && !isDrawingFeatureImageRow,
+                loadProperties: shouldLoadProperties,
+                loadWordCount: shouldLoadWordCount,
+                loadCharacterCount: shouldLoadCharacterCount,
+                loadTaskCounts: shouldLoadTaskCounts
+            },
+            hydrationLevel
+        ),
         refreshMetadataVersionOnFeatureImageChange: shouldRefreshMetadataVersionOnFeatureImageChange
     });
 
     const drawingFeatureImage = useDrawingFeatureImage({
         app,
         file,
-        enabled: appearanceSettings.showImage,
+        enabled: hydrationLevel === 'visible' && appearanceSettings.showImage,
         source: drawingFeatureImageSource,
         metadataVersion
     });
@@ -546,7 +560,6 @@ export const FileItem = React.memo(function FileItem({
     const [isFeatureImageHidden, setIsFeatureImageHidden] = useState(false);
 
     // === Refs ===
-    const fileRef = useRef<HTMLDivElement | null>(null);
     const revealInFolderIconRef = useRef<HTMLDivElement | null>(null);
     const addTagIconRef = useRef<HTMLDivElement | null>(null);
     const addShortcutIconRef = useRef<HTMLDivElement | null>(null);
@@ -1177,6 +1190,7 @@ export const FileItem = React.memo(function FileItem({
             placement: getTooltipPlacement()
         });
     }, [
+        fileRef,
         isMobile,
         file,
         file.stat.ctime,
@@ -1533,6 +1547,8 @@ export const FileItem = React.memo(function FileItem({
                                         <img
                                             key={effectiveFeatureImageKey ?? effectiveFeatureImageUrl}
                                             src={effectiveFeatureImageUrl}
+                                            loading="lazy"
+                                            decoding="async"
                                             alt={strings.common.featureImageAlt}
                                             className="nn-file-thumbnail-img"
                                             ref={featureImageImgRef}

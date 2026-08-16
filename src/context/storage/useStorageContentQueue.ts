@@ -18,7 +18,7 @@
 
 import { useCallback, type MutableRefObject } from 'react';
 import { App, TFile } from 'obsidian';
-import type { ContentProviderType, FileContentType } from '../../interfaces/IContentProvider';
+import type { ContentProviderType, ContentWorkPriority, FileContentType } from '../../interfaces/IContentProvider';
 import type { ContentProviderRegistry } from '../../services/content/ContentProviderRegistry';
 import type { NotebookNavigatorSettings } from '../../settings/types';
 import { getDBInstance } from '../../storage/fileOperations';
@@ -44,7 +44,8 @@ export function useStorageContentQueue(params: {
     queueMetadataContentWhenReady: (
         files: TFile[],
         includeTypes?: ContentProviderType[],
-        settingsOverride?: NotebookNavigatorSettings
+        settingsOverride?: NotebookNavigatorSettings,
+        priority?: ContentWorkPriority
     ) => void;
 }): {
     queueIndexableFilesForContentGeneration: (files: TFile[], settings: NotebookNavigatorSettings) => { markdownFiles: TFile[] };

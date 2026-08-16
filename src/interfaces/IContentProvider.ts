@@ -18,6 +18,7 @@
 
 import { TFile } from 'obsidian';
 import type { NotebookNavigatorSettings } from '../settings/types';
+import type { ContentWorkPriority as SchedulerContentWorkPriority } from '../services/content/ContentWorkScheduler';
 
 /**
  * Types of content providers.
@@ -25,6 +26,7 @@ import type { NotebookNavigatorSettings } from '../settings/types';
  * These values identify providers in the ContentProviderRegistry include/exclude lists.
  */
 export type ContentProviderType = 'fileThumbnails' | 'metadata' | 'tags' | 'markdownPipeline';
+export type ContentWorkPriority = SchedulerContentWorkPriority;
 
 /**
  * Types of file content that can be generated and stored.
@@ -74,7 +76,7 @@ export interface IContentProvider {
      * Queues files for content generation
      * @param files - Files that need content generation
      */
-    queueFiles(files: TFile[]): void;
+    queueFiles(files: TFile[], options?: { priority?: ContentWorkPriority }): void;
 
     /**
      * Starts processing queued files

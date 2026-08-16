@@ -66,6 +66,22 @@ export type PdfPreflightDecision = {
     };
 };
 
+export function isPdfSourceSizeAllowed(sizeBytes: number, maxBytes: number): boolean {
+    return Number.isFinite(sizeBytes) && sizeBytes >= 0 && Number.isFinite(maxBytes) && maxBytes >= 0 && sizeBytes <= maxBytes;
+}
+
+export function isPdfViewportWithinPixelLimit(width: number, height: number, maxPixels: number): boolean {
+    return (
+        Number.isFinite(width) &&
+        width > 0 &&
+        Number.isFinite(height) &&
+        height > 0 &&
+        Number.isFinite(maxPixels) &&
+        maxPixels > 0 &&
+        width <= maxPixels / height
+    );
+}
+
 // PDF name tokens used by the raw byte scanner.
 const PDF_TOKEN_SUBTYPE = '/Subtype';
 const PDF_TOKEN_IMAGE = '/Image';

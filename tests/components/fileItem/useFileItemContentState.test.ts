@@ -21,7 +21,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { createDefaultFileData, type FileData } from '../../../src/storage/IndexedDBStorage';
 import {
     applyFileItemContentChangeToBox,
+    isAbortError,
     loadFileItemCacheSnapshot,
+    resolveViewportGatedLoadOptions,
+    shouldRequestDirectImageThumbnail,
     shouldRefreshFileItemMetadataVersionForContentChange,
     subscribeToFileItemContentState,
     type FileItemCacheSnapshot,
@@ -86,6 +89,127 @@ function createContentBox(patch?: Partial<FileItemContentBox>): FileItemContentB
 }
 
 describe('useFileItemContentState helpers', () => {
+    it('recognizes cross-realm abort-shaped errors without instanceof Error', () => {
+        expect(isAbortError({ name: 'AbortError' })).toBe(true);
+        expect(isAbortError(new Error('boom'))).toBe(false);
+        expect(isAbortError(null)).toBe(false);
+    });
+
+    it('queues direct thumbnails only for visible missing rows and throttles repeats', () => {
+        const lastRequest = { key: 'f:images/photo.jpg@456:256', at: 1_000 };
+        expect(
+            shouldRequestDirectImageThumbnail({
+                shouldLoadFeatureImage: false,
+                featureImageStatus: 'none',
+                expectedKey: lastRequest.key,
+                lastRequest: null,
+                now: 2_000
+            })
+        ).toBe(false);
+        expect(
+            shouldRequestDirectImageThumbnail({
+                shouldLoadFeatureImage: true,
+                featureImageStatus: 'unprocessed',
+                expectedKey: 'f:images/photo.jpg@456:256',
+                lastRequest: null,
+                now: 20_000
+            })
+        ).toBe(true);
+        expect(
+            shouldRequestDirectImageThumbnail({
+                shouldLoadFeatureImage: true,
+                featureImageStatus: 'none',
+                expectedKey: 'f:images/photo.jpg@456:256',
+                lastRequest: null,
+                now: 20_000
+            })
+        ).toBe(false);
+        expect(
+            shouldRequestDirectImageThumbnail({
+                shouldLoadFeatureImage: true,
+                featureImageStatus: 'none',
+                expectedKey: lastRequest.key,
+                lastRequest,
+                now: 2_000
+            })
+        ).toBe(false);
+        expect(
+            shouldRequestDirectImageThumbnail({
+                shouldLoadFeatureImage: true,
+                featureImageStatus: 'has',
+                expectedKey: lastRequest.key,
+                lastRequest: null,
+                now: 2_000
+            })
+        ).toBe(false);
+    });
+
+    it('uses the durable local-thumbnail key for a direct raster row', () => {
+        const file = createTestTFile('images/photo.jpg');
+        file.stat.mtime = 456;
+        const snapshot = loadFileItemCacheSnapshot({
+            app: new App(),
+            file,
+            showPreview: false,
+            showImage: true,
+            fileStatMtime: file.stat.mtime,
+            db: createContentDb(null),
+            loadOptions: { loadFeatureImage: true }
+        });
+
+        expect(snapshot.featureImageKey).toBe('f:images/photo.jpg@456:256');
+    });
+
+    it('invalidates a direct raster thumbnail when the target pixel size changes', () => {
+        const file = createTestTFile('images/photo.jpg');
+        file.stat.mtime = 456;
+        const snapshot = loadFileItemCacheSnapshot({
+            app: new App(),
+            file,
+            showPreview: false,
+            showImage: true,
+            featureImagePixelSize: '384',
+            db: createContentDb(
+                createFileRecord({
+                    featureImageKey: 'f:images/photo.jpg@456:256',
+                    featureImageStatus: 'has'
+                })
+            ),
+            loadOptions: { loadFeatureImage: true }
+        });
+
+        expect(snapshot.featureImageKey).toBe('f:images/photo.jpg@456:384');
+        expect(snapshot.featureImageStatus).toBe('unprocessed');
+    });
+
+    it('gates shell, overscan metadata, and visible preview/image loads independently', () => {
+        const requested = {
+            loadPreviewText: true,
+            loadTags: false,
+            loadFeatureImage: true,
+            loadProperties: true,
+            loadWordCount: false,
+            loadCharacterCount: true,
+            loadTaskCounts: true
+        };
+
+        expect(resolveViewportGatedLoadOptions(requested, 'shell')).toEqual({
+            loadPreviewText: false,
+            loadTags: false,
+            loadFeatureImage: false,
+            loadProperties: false,
+            loadWordCount: false,
+            loadCharacterCount: false,
+            loadTaskCounts: false
+        });
+        expect(resolveViewportGatedLoadOptions(requested, 'metadata')).toEqual({
+            ...requested,
+            loadPreviewText: false,
+            loadFeatureImage: false
+        });
+        expect(resolveViewportGatedLoadOptions(requested, 'visible')).toEqual(requested);
+    });
+
     it('loads preview, tags, properties, and counters from the cache snapshot', () => {
         const file = createTestTFile('Notes/Daily.md');
         const properties = [{ fieldKey: 'status', value: 'open', valueKind: 'string' as const }];
@@ -407,7 +531,7 @@ describe('useFileItemContentState helpers', () => {
         expect(next.properties).toBe(prev.properties);
     });
 
-    it('versions direct image resource URLs by file mtime', () => {
+    it('does not expose an original full-resolution resource URL for a direct image', () => {
         const app = new App();
         const file = createTestTFile('Assets/Image.png');
         file.stat.mtime = 1234;
@@ -421,8 +545,8 @@ describe('useFileItemContentState helpers', () => {
             db: createContentDb(null)
         });
 
-        expect(snapshot.featureImageKey).toBe('direct-image:Assets/Image.png@1234');
-        expect(snapshot.featureImageUrl).toBe('app://local/Assets/Image.png?nn-mtime=1234');
+        expect(snapshot.featureImageKey).toBe('f:Assets/Image.png@1234:256');
+        expect(snapshot.featureImageUrl).toBeNull();
     });
 
     it('does not create direct preview URLs for SVG files', () => {

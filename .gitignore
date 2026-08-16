@@ -27,6 +27,10 @@ AGENTS.md
 CLAUDE.md
 GEMINI.md
 
+# Local development metadata
+.hermes/
+graphify-out/
+
 # Ignore local build script
 scripts/build-local.sh
 scripts/build-local.ps1

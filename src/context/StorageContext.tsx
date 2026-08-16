@@ -96,7 +96,7 @@ interface StorageContextValue {
     hasPreview: (path: string) => boolean;
     // Storage initialization state
     isStorageReady: boolean;
-    stopAllProcessing: () => void;
+    stopAllProcessing: () => Promise<void>;
     rebuildCache: () => Promise<void>;
     regenerateFeatureImageForFile: (file: TFile) => Promise<void>;
 }
@@ -165,7 +165,7 @@ export function StorageProvider({ app, api, children }: StorageProviderProps) {
         useActiveProfile();
     const uxPreferences = useUXPreferences();
     const showHiddenItems = uxPreferences.showHiddenItems;
-    const { tagTreeService, propertyTreeService } = useServices();
+    const { plugin, tagTreeService, propertyTreeService } = useServices();
     const [fileData, setFileData] = useState<StorageFileData>({
         tagTree: new Map(),
         propertyTree: new Map(),
@@ -193,7 +193,7 @@ export function StorageProvider({ app, api, children }: StorageProviderProps) {
     const metadataChangeFlushBufferRef = useRef<PendingFileFlushBuffer>({ files: new Map(), timerId: null, isProcessing: false });
     // Buffered vault rename events awaiting the zero-delay batched flush. Owned here so buffered
     // entries survive remounts of the vault-sync effect.
-    const renameFlushBufferRef = useRef<PendingRenameFlushBuffer>({ moves: [], timerId: null });
+    const renameFlushBufferRef = useRef<PendingRenameFlushBuffer>({ moves: [], timerId: null, flushPromise: null });
     const latestSettingsRef = useRef(settings);
     latestSettingsRef.current = settings;
     const activeVaultEventRefs = useRef<EventRef[] | null>(null);
@@ -513,7 +513,7 @@ export function StorageProvider({ app, api, children }: StorageProviderProps) {
 
     // Initializes providers before settings-sync hooks schedule any provider work.
     useInitializeContentProviderRegistry({
-        app,
+        contentProviderRuntime: plugin,
         contentRegistryRef: contentRegistry,
         pendingSyncTimeoutIdRef: pendingSyncTimeoutId,
         clearCacheRebuildNotice
@@ -619,6 +619,7 @@ export function StorageProvider({ app, api, children }: StorageProviderProps) {
                 }
                 // Drop buffered renames and their flush timer; the next session's full diff reconciles them
                 const renameBuffer = renameFlushBufferRef.current;
+                const renameFlushPromise = renameBuffer.flushPromise ?? Promise.resolve();
                 if (renameBuffer.timerId !== null) {
                     if (typeof window !== 'undefined') {
                         window.clearTimeout(renameBuffer.timerId);
@@ -650,6 +651,7 @@ export function StorageProvider({ app, api, children }: StorageProviderProps) {
                 // Clean up all tracked metadata wait disposers on shutdown
                 disposeMetadataWaitDisposers();
                 pendingMetadataWaitPathsRef.current.clear();
+                return renameFlushPromise;
             }
         };
     }, [cancelTreeRebuildDebouncer, resetPendingSettingsChanges, contextValue, disposeMetadataWaitDisposers, app.vault, app.metadataCache]);

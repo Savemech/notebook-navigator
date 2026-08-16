@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "pluginVersion": "3.3.3",
+  "capturedAt": "2026-08-14",
+  "fixture": {
+    "indexableFiles": 23976,
+    "markdownFiles": 22844,
+    "imageCandidates": 1132
+  },
+  "structuralModel": {
+    "manualSortMountedRows": 22844,
+    "eagerImageCandidates": 1132,
+    "desktopDecodedPixelBudget": 9007199254740991
+  },
+  "targetBudgets": {
+    "mountedRows": 250,
+    "visibleImages": 64,
+    "desktopDecodedPixels": 100000000,
+    "firstUsableListPaintMs": 2000,
+    "manualSortOpenMs": 250,
+    "interactionQuietWindowMs": 300
+  },
+  "reportedSymptom": {
+    "approximateApplicationPrivateBytes": 18253611008,
+    "source": "user observation",
+    "pluginDisabledRestoresResponsiveness": true
+  },
+  "runtimeBaseline": {
+    "wallTimeMs": null,
+    "phaseP50Ms": null,
+    "phaseP95Ms": null,
+    "phaseMaxMs": null,
+    "longTasks": null,
+    "rendererPrivateBytes": null,
+    "gpuPrivateBytes": null,
+    "jsHeapBytes": null,
+    "mountedRows": null,
+    "liveObjectUrls": null,
+    "providerQueueHighWater": null,
+    "blobQueueHighWater": null,
+    "activeDecodedPixels": null,
+    "activePdfRenders": null,
+    "runtimeInstances": null
+  },
+  "limitations": [
+    "No controlled Electron renderer/GPU/private-bytes capture was available for the original 3.3.3 state.",
+    "Null runtime fields are intentionally not inferred from IndexedDB disk size or structural arithmetic.",
+    "Use docs/performance/performance-contract.md to capture a comparable runtime baseline and after-state."
+  ]
+}

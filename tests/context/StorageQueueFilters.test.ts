@@ -23,7 +23,11 @@ import { DEFAULT_SETTINGS } from '../../src/settings/defaultSettings';
 import type { ContentProviderType } from '../../src/interfaces/IContentProvider';
 import type { NotebookNavigatorSettings } from '../../src/settings/types';
 import type { FileData } from '../../src/storage/IndexedDBStorage';
-import { filterFilesRequiringFileThumbnails, filterFilesRequiringMetadataSources } from '../../src/context/storageQueueFilters';
+import {
+    filterFilesRequiringFileThumbnails,
+    filterFilesRequiringMetadataSources,
+    shouldQueueFileThumbnailProvider
+} from '../../src/context/storageQueueFilters';
 import { getDrawingDirectFeatureImageKey } from '../../src/utils/drawingFeatureImages';
 
 class FakeDB {
@@ -515,7 +519,7 @@ describe('Storage queue filters', () => {
             createFileData({
                 mtime: file.stat.mtime,
                 fileThumbnailsMtime: 0,
-                featureImageKey: `f:${file.path}@${file.stat.mtime}`,
+                featureImageKey: `f:${file.path}@${file.stat.mtime}:256`,
                 featureImageStatus: 'has'
             })
         );
@@ -525,6 +529,28 @@ describe('Storage queue filters', () => {
         const result = filterFilesRequiringFileThumbnails([file], settings);
 
         expect(result).toEqual([file]);
+    });
+
+    it('allows visible-demand raster thumbnail generation without bulk startup queueing', () => {
+        const file = new TFile();
+        file.path = 'images/photo.jpg';
+        file.extension = 'jpg';
+        file.stat.mtime = 456;
+
+        db.setFile(
+            file.path,
+            createFileData({
+                mtime: file.stat.mtime,
+                fileThumbnailsMtime: 0,
+                featureImageKey: '',
+                featureImageStatus: 'none'
+            })
+        );
+
+        settings = { ...settings, showFeatureImage: true };
+
+        expect(shouldQueueFileThumbnailProvider(file)).toBe(true);
+        expect(filterFilesRequiringFileThumbnails([file], settings)).toEqual([]);
     });
 
     it('excludes PDF files when fileThumbnailsMtime and featureImageKey are up-to-date', () => {
@@ -538,7 +564,7 @@ describe('Storage queue filters', () => {
             createFileData({
                 mtime: file.stat.mtime,
                 fileThumbnailsMtime: file.stat.mtime,
-                featureImageKey: `f:${file.path}@${file.stat.mtime}`,
+                featureImageKey: `f:${file.path}@${file.stat.mtime}:256`,
                 featureImageStatus: 'has'
             })
         );

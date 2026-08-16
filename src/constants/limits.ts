@@ -165,7 +165,16 @@ export const LIMITS = {
                  * - `createFeatureImageThumbnailRuntime()` to limit concurrent image decode/resize work.
                  */
                 mobile: 100_000_000,
-                desktop: Number.MAX_SAFE_INTEGER
+                desktop: 100_000_000
+            },
+            /**
+             * Hard coded-pixel cap checked from image headers before any browser decoder is invoked.
+             * This is separate from the shared budget: one pathological source must never monopolize
+             * the budget or make Chromium allocate an unbounded native decode surface.
+             */
+            maxSourceImagePixels: {
+                mobile: 30_000_000,
+                desktop: 100_000_000
             },
             maxImageBytes: {
                 local: {
@@ -217,6 +226,16 @@ export const LIMITS = {
              * Maximum concurrent PDF page renders on mobile.
              */
             maxParallelRendersMobile: 1,
+            /** Maximum PDF source size accepted before pdf.js is loaded. */
+            maxSourceBytes: {
+                mobile: 50_000_000,
+                desktop: 100_000_000
+            },
+            /** Maximum unscaled first-page viewport area accepted before rendering. */
+            maxPageViewportPixels: {
+                mobile: 15_000_000,
+                desktop: 50_000_000
+            },
             preflight: {
                 /**
                  * Conservative mobile render work budget (bytes) used to decide whether to skip PDF cover thumbnails.
@@ -262,6 +281,10 @@ export const LIMITS = {
          * - Values are defaults that can still be overridden by constructor options where supported.
          */
         featureImageCacheMaxEntriesDefault: 1000,
+        featureImageCacheMaxBytes: {
+            mobile: 32 * 1024 * 1024,
+            desktop: 128 * 1024 * 1024
+        },
         /**
          * Maximum number of preview text entries cached in memory.
          * Previews are small strings; 10k keeps scrolling snappy in large vaults without being too memory heavy.
@@ -286,7 +309,23 @@ export const LIMITS = {
          * - Keeps background work responsive: process in chunks, parallelize moderately, and backoff on failures.
          */
         queueBatchSize: 100,
-        parallelLimit: 10,
+        parallelLimit: 2,
+        scheduler: {
+            activeJobs: 2,
+            maxSourceBytes: {
+                mobile: 64 * 1024 * 1024,
+                desktop: 128 * 1024 * 1024
+            },
+            pdfSlots: {
+                mobile: 1,
+                desktop: 2
+            },
+            externalSlots: {
+                mobile: 2,
+                desktop: 4
+            },
+            backgroundStarvationThreshold: 8
+        },
         retry: {
             /**
              * Exponential backoff for retry-later semantics (e.g. waiting for metadata cache).

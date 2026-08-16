@@ -17,13 +17,8 @@
  */
 
 import { useEffect, type MutableRefObject } from 'react';
-import type { App } from 'obsidian';
+import type NotebookNavigatorPlugin from '../../main';
 import { ContentProviderRegistry } from '../../services/content/ContentProviderRegistry';
-import { ContentReadCache } from '../../services/content/ContentReadCache';
-import { MarkdownPipelineContentProvider } from '../../services/content/MarkdownPipelineContentProvider';
-import { createFeatureImageThumbnailRuntime, FeatureImageContentProvider } from '../../services/content/FeatureImageContentProvider';
-import { MetadataContentProvider } from '../../services/content/MetadataContentProvider';
-import { TagContentProvider } from '../../services/content/TagContentProvider';
 
 /**
  * Creates and tears down the `ContentProviderRegistry` used by `StorageContext`.
@@ -36,37 +31,26 @@ import { TagContentProvider } from '../../services/content/TagContentProvider';
  * Providers are registered once per `App` instance to avoid duplicating background queues when the view remounts.
  */
 export function useInitializeContentProviderRegistry(params: {
-    app: App;
+    contentProviderRuntime: Pick<NotebookNavigatorPlugin, 'acquireContentProviderRuntime'>;
     contentRegistryRef: MutableRefObject<ContentProviderRegistry | null>;
     pendingSyncTimeoutIdRef: MutableRefObject<number | null>;
     clearCacheRebuildNotice: () => void;
 }): void {
-    const { app, contentRegistryRef, pendingSyncTimeoutIdRef, clearCacheRebuildNotice } = params;
+    const { contentProviderRuntime, contentRegistryRef, pendingSyncTimeoutIdRef, clearCacheRebuildNotice } = params;
 
     useEffect(() => {
-        // Only create the registry once per app instance. `StorageContext` may mount/unmount with the view,
-        // but providers should not be duplicated across mounts.
-        if (!contentRegistryRef.current) {
-            const readCache = new ContentReadCache(app);
-            const thumbnailRuntime = createFeatureImageThumbnailRuntime();
-
-            contentRegistryRef.current = new ContentProviderRegistry();
-            contentRegistryRef.current.registerProvider(new MarkdownPipelineContentProvider(app, readCache, thumbnailRuntime));
-            contentRegistryRef.current.registerProvider(new FeatureImageContentProvider(app, readCache, thumbnailRuntime));
-            contentRegistryRef.current.registerProvider(new MetadataContentProvider(app));
-            contentRegistryRef.current.registerProvider(new TagContentProvider(app));
-        }
+        const session = contentProviderRuntime.acquireContentProviderRuntime();
+        contentRegistryRef.current = session.registry;
 
         return () => {
             // The rebuild notice is UI state owned by `StorageContext`, but its timer lives in this module.
             // Always clear it during teardown so the interval does not keep running after the view is closed.
             clearCacheRebuildNotice();
 
-            if (contentRegistryRef.current) {
-                // Stops provider queues and cancels any in-flight tasks.
-                contentRegistryRef.current.stopAllProcessing();
+            if (contentRegistryRef.current === session.registry) {
                 contentRegistryRef.current = null;
             }
+            session.release();
 
             // Cancel any pending deferred storage sync as an extra safeguard during teardown.
             if (pendingSyncTimeoutIdRef.current !== null) {
@@ -76,5 +60,5 @@ export function useInitializeContentProviderRegistry(params: {
                 pendingSyncTimeoutIdRef.current = null;
             }
         };
-    }, [app, clearCacheRebuildNotice, contentRegistryRef, pendingSyncTimeoutIdRef]);
+    }, [clearCacheRebuildNotice, contentProviderRuntime, contentRegistryRef, pendingSyncTimeoutIdRef]);
 }

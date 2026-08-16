@@ -168,7 +168,7 @@ export interface NotebookNavigatorHandle {
     triggerCollapse: () => void;
     triggerListGroupCollapse: () => boolean;
     triggerSelectedItemCollapse: () => boolean;
-    stopContentProcessing: () => void;
+    stopContentProcessing: () => Promise<void>;
     rebuildCache: () => Promise<void>;
     selectNextFile: () => Promise<boolean>;
     selectPreviousFile: () => Promise<boolean>;
@@ -927,9 +927,9 @@ export const NotebookNavigatorComponent = React.memo(
                     }
                 },
                 focusNavigationPane: focusNavigationPaneCallback,
-                stopContentProcessing: () => {
+                stopContentProcessing: async () => {
                     try {
-                        stopProcessingRef.current?.();
+                        await stopProcessingRef.current?.();
                     } catch (e) {
                         console.error('Failed to stop content processing:', e);
                     }

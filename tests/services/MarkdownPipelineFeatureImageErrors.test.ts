@@ -209,7 +209,7 @@ describe('MarkdownPipelineContentProvider feature image errors', () => {
 
         // Empty blobs are treated as a processed marker; status should move off `unprocessed` after an error.
         expect(updated.featureImageStatus).not.toBe('unprocessed');
-        expect(updated.featureImageKey).toBe(`f:${imageFile.path}@${imageFile.stat.mtime}`);
+        expect(updated.featureImageKey).toBe(`f:${imageFile.path}@${imageFile.stat.mtime}:256`);
 
         provider.queueFiles([noteFile]);
         await provider.runBatch(settings);

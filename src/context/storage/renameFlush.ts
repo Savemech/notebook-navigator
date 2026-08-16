@@ -44,6 +44,8 @@ export interface PendingRenameFlushBuffer {
     moves: PendingRenameMove[];
     /** Active flush timer id, or null when no flush is scheduled */
     timerId: number | null;
+    /** Latest in-flight flush, shared across effect generations */
+    flushPromise: Promise<void> | null;
 }
 
 /** Storage operations the rename flush uses; implemented by `IndexedDBStorage`. */
@@ -58,7 +60,7 @@ export interface RenameFlushController {
     /** Cancels an armed diff timer and arms the zero-delay flush for the buffered burst */
     scheduleFlush(): void;
     /** Cancels an armed flush timer and flushes buffered moves immediately (effect cleanup) */
-    flushNow(): void;
+    flushNow(): Promise<void>;
 }
 
 /**
@@ -164,15 +166,15 @@ export function createRenameFlushController(params: {
         }
     };
 
-    const flush = () => {
+    const flush = (): Promise<void> => {
         buffer.timerId = null;
         const moves = buffer.moves;
         if (moves.length === 0) {
-            return;
+            return buffer.flushPromise ?? Promise.resolve();
         }
         buffer.moves = [];
 
-        runAsyncAction(async () => {
+        const execute = async () => {
             if (isStopped()) {
                 // Buffered renames are dropped during a shutdown or cache-rebuild stop window; the
                 // next full diff recreates the records from the vault. Consume the pending rename
@@ -263,7 +265,17 @@ export function createRenameFlushController(params: {
 
             queueContentRefresh(moves.map(move => move.file));
             scheduleDiff();
+        };
+        const previous = buffer.flushPromise;
+        const current = previous ? previous.catch(() => undefined).then(execute) : execute();
+        const tracked = current.finally(() => {
+            if (buffer.flushPromise === tracked) {
+                buffer.flushPromise = null;
+            }
         });
+        buffer.flushPromise = tracked;
+        runAsyncAction(() => tracked);
+        return tracked;
     };
 
     const scheduleFlush = () => {
@@ -280,10 +292,10 @@ export function createRenameFlushController(params: {
             buffer.timerId = window.setTimeout(flush, 0);
             return;
         }
-        flush();
+        void flush();
     };
 
-    const flushNow = () => {
+    const flushNow = (): Promise<void> => {
         if (buffer.timerId !== null) {
             if (typeof window !== 'undefined') {
                 window.clearTimeout(buffer.timerId);
@@ -291,8 +303,9 @@ export function createRenameFlushController(params: {
             buffer.timerId = null;
         }
         if (buffer.moves.length > 0) {
-            flush();
+            return flush();
         }
+        return buffer.flushPromise ?? Promise.resolve();
     };
 
     return { scheduleFlush, flushNow };

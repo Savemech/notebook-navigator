@@ -60,4 +60,38 @@ describe('FeatureImageBlobCache', () => {
         expect(cache.get('docs/old.pdf', 'f:docs/old.pdf@123')).toBeNull();
         expect(cache.get('docs/new.pdf', 'f:docs/new.pdf@123')).toBe(blob);
     });
+
+    it('evicts least recently used entries by encoded Blob bytes', () => {
+        const cache = new FeatureImageBlobCache(10, 3);
+        const blobA = new Blob(['aa']);
+        const blobB = new Blob(['bb']);
+
+        cache.set('a', { featureImageKey: 'ka', blob: blobA });
+        cache.set('b', { featureImageKey: 'kb', blob: blobB });
+
+        expect(cache.get('a', 'ka')).toBeNull();
+        expect(cache.get('b', 'kb')).toBe(blobB);
+        expect(cache.getTotalBytes()).toBe(2);
+
+        cache.set('oversized', { featureImageKey: 'ko', blob: new Blob(['1234']) });
+        expect(cache.get('oversized', 'ko')).toBeNull();
+        expect(cache.get('b', 'kb')).toBe(blobB);
+        expect(cache.getTotalBytes()).toBe(2);
+    });
+
+    it('keeps byte accounting exact across replacement, move, mismatch, and clear', () => {
+        const cache = new FeatureImageBlobCache(10, 100);
+        cache.set('a', { featureImageKey: 'ka', blob: new Blob(['1234']) });
+        cache.set('a', { featureImageKey: 'kb', blob: new Blob(['12']) });
+        expect(cache.getTotalBytes()).toBe(2);
+
+        cache.move('a', 'b');
+        expect(cache.getTotalBytes()).toBe(2);
+        expect(cache.get('b', 'wrong')).toBeNull();
+        expect(cache.getTotalBytes()).toBe(0);
+
+        cache.set('c', { featureImageKey: 'kc', blob: new Blob(['123']) });
+        cache.clear();
+        expect(cache.getTotalBytes()).toBe(0);
+    });
 });
